@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "leds": "cucumber",
+  "id": "cucumber",
+  "name": "Yandex Station Midi",
+  "audio": {
+    "device": "default",
+    "format": "S16",
+    "mixer_device": "default",
+    "mixer_control": "Master",
+    "mixer_index": 0,
+    "mixer_channel": "front_left"
+  },
+  "voice": {
+    "protocol": "quasar",
+    "address": "127.0.0.1:9875"
+  },
+  "controls": {
+    "driver": "evdev",
+    "input_name": "awinic_sar",
+    "mapping": {
+      "bindings": [
+        { "code": 582, "action": "toggle" },
+        { "code": 115, "action": "volume_up", "repeat": true },
+        { "code": 114, "action": "volume_down", "repeat": true }
+      ],
+      "gestures": [
+        { "from": 582, "to": 115, "action": "next" },
+        { "from": 582, "to": 114, "action": "previous" }
+      ],
+      "gesture_ms": 250,
+      "repeat_delay_ms": 450,
+      "repeat_ms": 180,
+      "volume_step": 5
+    }
+  }
+}

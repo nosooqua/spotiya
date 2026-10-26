@@ -22,8 +22,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "process", "macros", "signal", "sync", "time"] }
 
 sha2 = "0.10"
+base64 = "0.22"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4", default-features = false }
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
 ruzstd = { version = "0.7", default-features = false, features = ["std"] }
 
 [build-dependencies]

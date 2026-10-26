@@ -13,6 +13,7 @@ use std::{
 };
 
 const BANDS: usize = 4;
+#[cfg(test)]
 const WINDOW: u32 = SAMPLE_RATE / 20;
 const CENTERS: [f32; BANDS] = [100.0, 400.0, 1600.0, 6400.0];
 
@@ -79,8 +80,8 @@ struct Band {
     z2: [f32; 2],
 }
 impl Band {
-    fn new(center: f32) -> Self {
-        let omega = 2.0 * std::f32::consts::PI * center / SAMPLE_RATE as f32;
+    fn new(center: f32, rate: u32) -> Self {
+        let omega = 2.0 * std::f32::consts::PI * center / rate as f32;
         let alpha = omega.sin() / (2.0 * 0.7);
         let a0 = 1.0 + alpha;
         Self {
@@ -103,11 +104,16 @@ struct Analyzer {
     energy: [f32; BANDS],
     envelope: [f32; BANDS],
     frames: u32,
+    window: u32,
 }
 impl Analyzer {
     fn new() -> Self {
+        Self::at_rate(SAMPLE_RATE)
+    }
+    fn at_rate(rate: u32) -> Self {
         Self {
-            bands: CENTERS.map(Band::new),
+            bands: CENTERS.map(|center| Band::new(center, rate)),
+            window: rate / 20,
             energy: [0.0; BANDS],
             envelope: [0.0; BANDS],
             frames: 0,
@@ -127,7 +133,7 @@ impl Analyzer {
                 }
             }
             self.frames += 1;
-            if self.frames == WINDOW {
+            if self.frames == self.window {
                 let mut levels = [0; BANDS];
                 for ((energy, envelope), level) in self
                     .energy
@@ -135,7 +141,7 @@ impl Analyzer {
                     .zip(&mut self.envelope)
                     .zip(&mut levels)
                 {
-                    let rms = (*energy / (WINDOW * 2) as f32).sqrt();
+                    let rms = (*energy / (self.window * 2) as f32).sqrt();
                     let target = ((20.0 * rms.max(1e-7).log10() + 54.0) / 48.0).clamp(0.0, 1.0);
                     let speed = if target > *envelope { 0.8 } else { 0.2 };
                     *envelope += (target - *envelope) * speed;
@@ -339,5 +345,120 @@ mod tests {
         sink.write(AudioPacket::Samples(vec![0.5; 30000]), &mut converter)
             .unwrap();
         assert_eq!(output.borrow()[29999], 0.5);
+    }
+}
+
+/// AirPlay PCM arrives through an optional observer loaded only in our Shairport child.
+/// Bind only while enabled: the observer then stops copying PCM when the socket disappears.
+pub const AIRPLAY_SOCKET: &str = "/run/spotiya-airplay/levels.sock";
+pub fn airplay_worker(shared: Arc<crate::Shared>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        use std::{
+            fs,
+            os::unix::{fs::PermissionsExt, net::UnixDatagram},
+            path::Path,
+            time::Duration,
+        };
+        let mut socket = None;
+        let mut rate = 0;
+        let mut analyzer = Analyzer::new();
+        let mut was_active = false;
+        while shared.running.load(Ordering::Acquire) {
+            let active = shared.airplay.active.load(Ordering::Acquire) && shared.spectrum.enabled();
+            if active && !was_active {
+                shared.spectrum.clear();
+                analyzer = Analyzer::new();
+                rate = 0;
+            }
+            was_active = active;
+            if !active {
+                if socket.take().is_some() {
+                    let _ = fs::remove_file(AIRPLAY_SOCKET);
+                }
+            } else {
+                if socket.is_none() && Path::new("/run/spotiya-airplay").is_dir() {
+                    // The receiver lock prevents concurrent listeners; remove only its own stale socket.
+                    let _ = fs::remove_file(AIRPLAY_SOCKET);
+                    socket = UnixDatagram::bind(AIRPLAY_SOCKET)
+                        .ok()
+                        .filter(|s| s.set_nonblocking(true).is_ok());
+                    let _ = fs::set_permissions(AIRPLAY_SOCKET, fs::Permissions::from_mode(0o600));
+                }
+                if let Some(socket) = &socket {
+                    let mut packet = [0u8; 4105];
+                    for _ in 0..64 {
+                        let Ok(n) = socket.recv(&mut packet) else {
+                            break;
+                        };
+                        if let Some((sample_rate, samples)) = airplay_packet(&packet[..n]) {
+                            if rate != sample_rate {
+                                analyzer = Analyzer::at_rate(sample_rate);
+                                rate = sample_rate;
+                            }
+                            analyzer.feed(&samples, &shared.spectrum);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(socket);
+        let _ = fs::remove_file(AIRPLAY_SOCKET);
+    })
+}
+fn airplay_packet(data: &[u8]) -> Option<(u32, Vec<f64>)> {
+    if data.len() <= 8
+        || data.len() > 4104
+        || !(data.len() - 8).is_multiple_of(4)
+        || data[..4] != [b'S', b'P', b'V', 1]
+    {
+        return None;
+    }
+    let rate = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    if !(16000..=192000).contains(&rate) {
+        return None;
+    }
+    Some((
+        rate,
+        data[8..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| f64::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
+            .collect(),
+    ))
+}
+#[cfg(test)]
+mod airplay_tests {
+    use super::*;
+    #[test]
+    fn pcm_protocol_and_rates() {
+        let mut packet = vec![b'S', b'P', b'V', 1];
+        packet.extend_from_slice(&48000u32.to_le_bytes());
+        packet.extend_from_slice(&[0, 128, 255, 127]);
+        assert_eq!(
+            airplay_packet(&packet),
+            Some((48000, vec![-1.0, 32767.0 / 32768.0]))
+        );
+        assert!(airplay_packet(&packet[..11]).is_none());
+        packet[3] = 2;
+        assert!(airplay_packet(&packet).is_none());
+        for rate in [44100, 48000, 96000] {
+            let samples: Vec<_> = (0..rate / 2)
+                .flat_map(|n| {
+                    let v = (2.0 * std::f64::consts::PI * 1600.0 * f64::from(n) / f64::from(rate))
+                        .sin()
+                        * 0.25;
+                    [v, -v]
+                })
+                .collect();
+            let spectrum = Spectrum::new(true);
+            Analyzer::at_rate(rate).feed(&samples, &spectrum);
+            let levels = spectrum.frame().unwrap();
+            assert_eq!(
+                levels.iter().enumerate().max_by_key(|(_, v)| *v).unwrap().0,
+                2
+            );
+        }
     }
 }

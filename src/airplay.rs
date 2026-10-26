@@ -255,6 +255,10 @@ impl Runtime {
             .stderr(output)
             .kill_on_drop(true)
             .process_group(0);
+        if program == "shairport-sync" {
+            cmd.env("LD_PRELOAD", self.runtime.join("visual.so"))
+                .env("SPOTIYA_SPECTRUM_SOCKET", crate::spectrum::AIRPLAY_SOCKET);
+        }
         unsafe {
             cmd.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
@@ -275,6 +279,14 @@ impl Runtime {
     }
     async fn start(&mut self, gate: &Gate) -> io::Result<()> {
         fs::create_dir_all(&self.runtime)?;
+        fs::write(
+            self.runtime.join("visual.so.new"),
+            include_bytes!(concat!(env!("OUT_DIR"), "/airplay-tap.so")),
+        )?;
+        fs::rename(
+            self.runtime.join("visual.so.new"),
+            self.runtime.join("visual.so"),
+        )?;
         fs::set_permissions(&self.runtime, fs::Permissions::from_mode(0o700))?;
         let _ = fs::remove_file(self.runtime.join("bus"));
         let bus = format!(

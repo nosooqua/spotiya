@@ -2737,6 +2737,7 @@ name = "spotiya"
 version = "0.9.4"
 dependencies = [
  "alsa",
+ "base64 0.22.1",
  "cc",
  "env_logger",
  "flate2",
@@ -2750,6 +2751,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "symphonia",
  "tar",
  "tokio",
  "uuid",

@@ -40,6 +40,8 @@ class MaintenanceCLI(unittest.TestCase):
                 (["name", "spotify", "Кухня"], ["--device-name", "spotify", "Кухня"]),
                 (["name", "reset"], ["--device-name", "reset"]),
                 (["name", "reset", "airplay"], ["--device-name", "reset", "airplay"]),
+                (["inputs"], ["--inputs"]),
+                (["input-monitor", "midi_touch"], ["--input-monitor", "midi_touch"]),
                 (["addon", "install", "airplay"], ["--addon-install", "airplay"]),
                 (["addon", "remove", "airplay"], ["--addon-remove", "airplay"]),
                 (["addon", "file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"], ["--addon-install-file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"]),

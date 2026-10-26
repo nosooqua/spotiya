@@ -11,6 +11,7 @@ __pycache__/
 /config.json
 /controls/mini2/test-buttons
 /controls/mini2/test-lights
+/controls/mini2/test-mapped-input
 
 *.apk
 *.sdi

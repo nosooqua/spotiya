@@ -41,7 +41,11 @@ mod control;
 mod device;
 mod doctor;
 mod ducking;
+mod input;
 mod installation;
+mod led_clock;
+mod led_native;
+mod leds;
 mod logging;
 mod playback;
 mod profile_selection;
@@ -54,9 +58,11 @@ mod tui;
 mod update;
 mod voice;
 mod volume_guard;
+mod volume_sound;
 
 struct Command {
     action: i32,
+    volume_step: u32,
     deadline: std::time::Instant,
     reply: std::sync::mpsc::SyncSender<bool>,
 }
@@ -71,11 +77,14 @@ type SpircTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Connecting = Pin<Box<dyn Future<Output = Option<Result<(Spirc, SpircTask), Error>>>>>;
 struct Shared {
     running: AtomicBool,
+    controls_enabled: AtomicBool,
     active: AtomicBool,
     paused: AtomicBool,
     volume: AtomicU16,
     commands: mpsc::UnboundedSender<Command>,
     spectrum: Arc<spectrum::Spectrum>,
+    feedback: leds::Feedback,
+    volume_cue: volume_sound::Cue,
     airplay: Arc<airplay::Gate>,
     ducking: Arc<ducking::Ducking>,
 }
@@ -101,7 +110,7 @@ pub unsafe extern "C" fn mini2_receiver_status(paused: *mut i32, volume: *mut i3
         *paused = s.paused.load(Ordering::Relaxed) as i32;
         *volume = percent(s.volume.load(Ordering::Relaxed)) as i32;
     }
-    s.active.load(Ordering::Acquire) as i32
+    (s.active.load(Ordering::Acquire) && s.controls_enabled.load(Ordering::Acquire)) as i32
 }
 /// # Safety
 /// A non-null `levels` must reference four writable bytes for this call.
@@ -126,10 +135,18 @@ pub unsafe extern "C" fn mini2_receiver_spectrum(levels: *mut u8) -> i32 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn mini2_receiver_command(action: i32) -> i32 {
+    controls_receiver_command(action, 5)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn controls_receiver_command(action: i32, volume_step: u32) -> i32 {
     let Some(s) = SHARED.get() else {
         return 0;
     };
-    if !(0..=4).contains(&action) || !s.active.load(Ordering::Acquire) {
+    if !(0..=4).contains(&action)
+        || !(1..=20).contains(&volume_step)
+        || !s.active.load(Ordering::Acquire)
+        || !s.controls_enabled.load(Ordering::Acquire)
+    {
         return 0;
     }
     let timeout = Duration::from_millis(400);
@@ -138,6 +155,7 @@ pub extern "C" fn mini2_receiver_command(action: i32) -> i32 {
     if s.commands
         .send(Command {
             action,
+            volume_step,
             deadline,
             reply,
         })
@@ -274,6 +292,7 @@ fn options() -> Result<Option<Options>, String> {
     };
     let mut args = std::env::args().skip(1);
     let mut name_action = None;
+    let mut led_preview = None;
     let mut profile_info = false;
     let mut profile_list = false;
     let mut profile_select = None;
@@ -321,6 +340,7 @@ fn options() -> Result<Option<Options>, String> {
                 result.profile = Some(args.next().ok_or("missing profile id or JSON path")?)
             }
             "--profile-info" => profile_info = true,
+            "--led-preview" => led_preview = Some(args.next().ok_or("missing LED effect")?),
             "--profiles" => profile_list = true,
             "--profile-select" => {
                 profile_select = Some(args.next().ok_or("missing profile id or JSON path")?)
@@ -372,6 +392,19 @@ fn options() -> Result<Option<Options>, String> {
             "--supervise" => result.supervise = true,
             "--no-buttons" => result.buttons = false,
             "--no-voice" => result.voice = false,
+            "--inputs" => {
+                input::list().map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
+            "--input-monitor" => {
+                input::monitor(
+                    &args
+                        .next()
+                        .ok_or("missing input name or /dev/input/eventN")?,
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
             "--tui" => {
                 tui::run(&result.state_dir, false).map_err(|e| e.to_string())?;
                 return Ok(None);
@@ -392,7 +425,8 @@ fn options() -> Result<Option<Options>, String> {
                 return Err("Pairing connection closed before login completed".into());
             }
             "--play" | "--resume" | "--pause" | "--next" | "--previous" | "--toggle"
-            | "--volume" | "--voice" | "--spectrum" | "--airplay" | "--release" | "--retry" => {
+            | "--volume" | "--voice" | "--controls" | "--spectrum" | "--airplay" | "--release"
+            | "--retry" => {
                 let command = match arg.as_str() {
                     "--play" => format!("PLAY {}", args.next().ok_or("missing music query")?),
                     "--resume" => "RESUME".to_owned(),
@@ -428,7 +462,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --device-name [NAME | spotify NAME | airplay NAME | reset [spotify|airplay]]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|midi|cucumber|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --device-name [NAME | spotify NAME | airplay NAME | reset [spotify|airplay]]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --inputs | --input-monitor NAME_OR_PATH\nspotiya --led-preview next|previous|pause|resume|volume:0..100\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --controls on/off | --spectrum on/off | --airplay on/off | --release | --retry"
                 );
                 return Ok(None);
             }
@@ -444,6 +478,7 @@ fn options() -> Result<Option<Options>, String> {
         profile_select.is_some(),
         profile_list,
         profile_info,
+        led_preview.is_some(),
         name_action.is_some(),
     ]
     .into_iter()
@@ -524,6 +559,16 @@ fn options() -> Result<Option<Options>, String> {
         profiles::list(&result.state_dir).map_err(|e| e.to_string())?;
         return Ok(None);
     }
+    if let Some(effect) = led_preview {
+        let profile = resolved_profile(&result).map_err(|e| e.to_string())?;
+        let model = profile
+            .profile
+            .leds
+            .filter(|m| m.available(Path::new("/")))
+            .ok_or("No supported LED output")?;
+        leds::preview(model, &effect).map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
     if profile_info {
         let resolved = resolved_profile(&result).map_err(|e| e.to_string())?;
         println!(
@@ -540,6 +585,7 @@ fn resolved_profile(options: &Options) -> io::Result<profiles::Resolved> {
         resolved.capabilities.buttons = false;
         resolved.capabilities.ring = false;
         resolved.capabilities.display = false;
+        resolved.capabilities.leds = false;
     }
     Ok(resolved)
 }
@@ -748,9 +794,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.trim() != "0")
             .unwrap_or(true);
     let spectrum_setting = options.state_dir.join("spectrum-enabled");
-    let spectrum_supported = caps.display;
-    let spectrum_enabled =
-        spectrum_supported && fs::read_to_string(&spectrum_setting).is_ok_and(|s| s.trim() == "1");
+    let led_model = profile.leds.filter(|_| caps.leds);
+    let spectrum_supported = caps.display || led_model.is_some();
+    let spectrum_enabled = spectrum_supported
+        && fs::read_to_string(&spectrum_setting)
+            .map(|s| s.trim() == "1")
+            .unwrap_or(led_model.is_some());
     let last_track_file = options.state_dir.join("last-track");
     let mut last_track = fs::read_to_string(&last_track_file)
         .ok()
@@ -777,17 +826,29 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     .port(10337)
     .launch()?;
     let (commands, mut command_rx) = mpsc::unbounded_channel();
+    let controls_setting = options.state_dir.join("controls-enabled");
+    let controls_enabled =
+        caps.controls() && fs::read_to_string(&controls_setting).is_ok_and(|s| s.trim() == "1");
+    // Existing installations and profiles enable controls unless explicitly disabled.
+    let controls_enabled = controls_enabled || (caps.controls() && !controls_setting.exists());
     let shared = Arc::new(Shared {
         running: AtomicBool::new(true),
+        controls_enabled: AtomicBool::new(controls_enabled),
         active: AtomicBool::new(false),
         paused: AtomicBool::new(false),
         volume: AtomicU16::new(0),
         commands,
+        feedback: leds::Feedback::default(),
+        volume_cue: volume_sound::Cue::default(),
         spectrum: Arc::new(spectrum::Spectrum::new(spectrum_enabled)),
         airplay: Arc::new(airplay::Gate::new()),
         ducking: Arc::new(ducking::Ducking::new()),
     });
     let _ = SHARED.set(shared.clone());
+    let led_worker = led_model.map(|model| leds::start(model, shared.clone()));
+    let airplay_visual = spectrum::airplay_worker(shared.clone());
+    let volume_sound =
+        led_model.map(|_| volume_sound::start(shared.clone(), profile.audio.device.clone()));
     let mixer = Arc::new(DeviceMixer {
         shared: shared.clone(),
         handle: Mutex::new(None),
@@ -879,7 +940,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             guard.run(address).await;
         })
     });
-    let controls = if caps.controls() {
+    let controls = if (caps.buttons || caps.ring || caps.display) && profile.controls.is_some() {
         let config = profile
             .controls
             .clone()
@@ -888,7 +949,15 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             std::thread::Builder::new()
                 .name("spotiya-controls".into())
                 .stack_size(128 * 1024)
-                .spawn(move || config.run(caps))?,
+                .spawn(move || {
+                    let result = config.run(caps);
+                    match &result {
+                        Ok(0) => {}
+                        Ok(code) => eprintln!("controls: driver exited with code {code}"),
+                        Err(error) => eprintln!("controls: {error}"),
+                    }
+                    result
+                })?,
         )
     } else {
         None
@@ -913,6 +982,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         name: names.spotify.clone(),
         airplay_name: names.airplay.clone(),
         voice: voice_enabled,
+        controls: controls_enabled,
+        controls_supported: caps.controls(),
         voice_supported: caps.voice,
         profile: profile.id.clone(),
         profile_selection: options
@@ -1067,7 +1138,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             } else {airplay.stop(&shared.airplay).await;}
                             accepted
                         },
-                        airplay::Action::End=>{shared.airplay.active.store(false,Ordering::Release);true},
+                        airplay::Action::End=>{if shared.airplay.active.swap(false,Ordering::AcqRel) { shared.feedback.show(leds::Effect::Pause); } true},
                         airplay::Action::Volume(value)=>{
                             if shared.airplay.active.load(Ordering::Acquire){mixer.set_master_volume(from_percent(value));}
                             true
@@ -1077,11 +1148,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let _=request.reply.send(accepted);
             },
             Some(command)=command_rx.recv()=>{
-                if std::time::Instant::now()>=command.deadline {continue;}
+                if std::time::Instant::now()>=command.deadline || !shared.controls_enabled.load(Ordering::Acquire) {continue;}
+                let airplay_was_active = shared.airplay.active.load(Ordering::Acquire);
+                let step=command.volume_step as i32;
                 let ok=if shared.airplay.active.load(Ordering::Acquire) {
                     if command.action==0 {airplay.stop(&shared.airplay).await;true}
                     else if matches!(command.action,3|4){
-                        let target=(percent(mixer.volume()) as i32+if command.action==3{5}else{-5}).clamp(0,100) as u16;
+                        let target=(percent(mixer.volume()) as i32+if command.action==3{step}else{-step}).clamp(0,100) as u16;
                         mixer.set_master_volume(from_percent(target));true
                     } else {false}
                 } else if let Some(handle)=spirc.as_ref().filter(|_| shared.active.load(Ordering::Acquire)) {
@@ -1091,13 +1164,22 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         2=>handle.prev().is_ok(),
                         3|4=>{
                             let old=percent(mixer.volume()) as i32;
-                            let target=(old+if command.action==3 {5}else{-5}).clamp(0,100) as u16;
+                            let target=(old+if command.action==3 {step}else{-step}).clamp(0,100) as u16;
                             mixer.set_master_volume(from_percent(target));
                             handle.set_volume(mixer.volume()).is_ok()
                         },
                         _=>false,
                     }
                 }else{false};
+                if ok {
+                    if matches!(command.action,3|4) { shared.volume_cue.notify(); }
+                    match command.action {
+                        1 => shared.feedback.show(leds::Effect::Next),
+                        2 => shared.feedback.show(leds::Effect::Previous),
+                        0 if airplay_was_active => shared.feedback.show(leds::Effect::Pause),
+                        _ => {},
+                    }
+                }
                 let _=command.reply.send(ok);
             },
             Some(event)=voice_rx.recv()=>{
@@ -1117,6 +1199,17 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("receiver: explicit retry scheduled");
                         } else {eprintln!("receiver: retry unavailable or cooling down");}
                         publish_status(&shared,&playback,&failures,rejected,&mut info,&mut last_status,&mut status_buffer);
+                        continue;
+                    },
+                    voice::Intent::Controls(enabled)=>{
+                        if caps.controls() {
+                            let temp=controls_setting.with_extension("new");
+                            if fs::write(&temp,if enabled{"1\n"}else{"0\n"})
+                                .and_then(|_| fs::rename(&temp,&controls_setting)).is_ok() {
+                                shared.controls_enabled.store(enabled,Ordering::Release);
+                                info.controls=enabled;
+                            } else {eprintln!("controls: could not save control setting");}
+                        }
                         continue;
                     },
                     voice::Intent::Voice(enabled)=>{
@@ -1154,6 +1247,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 if shared.airplay.active.load(Ordering::Acquire) {
                     if matches!(intent,voice::Intent::Pause|voice::Intent::Toggle) {
                         airplay.stop(&shared.airplay).await;
+                        shared.feedback.show(leds::Effect::Pause);
                         continue;
                     }
                     if matches!(intent,voice::Intent::Play(_)|voice::Intent::Resume) {airplay.stop(&shared.airplay).await;}
@@ -1192,8 +1286,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         match intent {
                             voice::Intent::Pause=>{let _=handle.pause();},
                             voice::Intent::Resume=>{let _=handle.play();},
-                            voice::Intent::Next=>{let _=handle.next();},
-                            voice::Intent::Previous=>{let _=handle.prev();},
+                            voice::Intent::Next if handle.next().is_ok()=>{ shared.feedback.show(leds::Effect::Next); },
+                            voice::Intent::Previous if handle.prev().is_ok()=>{ shared.feedback.show(leds::Effect::Previous); },
                             _=>{},
                         }
                         eprintln!("voice: Spotify transport command queued");
@@ -1256,6 +1350,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     voice_control.abort();
     let _ = fs::remove_file(voice::CONTROL);
     stop_connection(&mut spirc, &mut task, &session, &shared, &mut playback).await;
+    let _ = airplay_visual.join();
+    if let Some(worker) = volume_sound {
+        let _ = worker.join();
+    }
+    if let Some(worker) = led_worker {
+        let _ = worker.join();
+    }
     if let Some(controls) = controls {
         let _ = controls.join();
     }
@@ -1315,10 +1416,13 @@ mod tests {
         let (commands, mut receiver) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             running: AtomicBool::new(true),
+            controls_enabled: AtomicBool::new(true),
             active: AtomicBool::new(false),
             paused: AtomicBool::new(true),
             volume: AtomicU16::new(from_percent(37)),
             commands,
+            feedback: leds::Feedback::default(),
+            volume_cue: volume_sound::Cue::default(),
             spectrum: Arc::new(spectrum::Spectrum::new(false)),
             airplay: Arc::new(airplay::Gate::new()),
             ducking: Arc::new(ducking::Ducking::new()),
@@ -1330,6 +1434,7 @@ mod tests {
         let worker = std::thread::spawn(|| mini2_receiver_command(3));
         let command = receiver.recv().await.unwrap();
         assert_eq!(command.action, 3);
+        assert_eq!(command.volume_step, 5);
         command.reply.send(true).unwrap();
         assert_eq!(worker.join().unwrap(), 1);
         let (mut paused, mut volume) = (0, 0);
@@ -1338,6 +1443,19 @@ mod tests {
             1
         );
         assert_eq!((paused, volume), (1, 37));
+        shared.controls_enabled.store(false, Ordering::Release);
+        assert_eq!(controls_receiver_command(3, 2), 0);
+        assert_eq!(
+            unsafe { mini2_receiver_status(&mut paused, &mut volume) },
+            0
+        );
+        shared.controls_enabled.store(true, Ordering::Release);
+        assert_eq!(controls_receiver_command(3, 0), 0);
+        let worker = std::thread::spawn(|| controls_receiver_command(4, 2));
+        let command = receiver.recv().await.unwrap();
+        assert_eq!((command.action, command.volume_step), (4, 2));
+        command.reply.send(true).unwrap();
+        assert_eq!(worker.join().unwrap(), 1);
         let mut levels = [0; 4];
         assert_eq!(unsafe { mini2_receiver_spectrum(std::ptr::null_mut()) }, 0);
         assert_eq!(unsafe { mini2_receiver_spectrum(levels.as_mut_ptr()) }, 0);

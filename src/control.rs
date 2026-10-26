@@ -39,6 +39,8 @@ pub struct Status {
     pub connected: bool,
     pub voice: bool,
     pub voice_supported: bool,
+    pub controls: bool,
+    pub controls_supported: bool,
     pub profile: String,
     pub profile_selection: String,
     pub receiver_pid: u32,
@@ -63,6 +65,8 @@ pub fn parse(line: &str) -> Option<Intent> {
         "PREVIOUS" => Some(Intent::Previous),
         "VOICE ON" => Some(Intent::Voice(true)),
         "VOICE OFF" => Some(Intent::Voice(false)),
+        "CONTROLS ON" => Some(Intent::Controls(true)),
+        "CONTROLS OFF" => Some(Intent::Controls(false)),
         "SPECTRUM ON" => Some(Intent::Spectrum(true)),
         "SPECTRUM OFF" => Some(Intent::Spectrum(false)),
         "AIRPLAY ON" => Some(Intent::Airplay(true)),
@@ -190,6 +194,8 @@ pub async fn serve(
                     "ERROR Playback stopped after repeated failures; use retry\n".into()
                 } else if matches!(intent, Intent::Voice(_)) && !capabilities.voice {
                     "ERROR Voice control is unavailable in this device profile\n".into()
+                } else if matches!(intent, Intent::Controls(_)) && !capabilities.controls() {
+                    "ERROR Physical controls are unavailable in this device profile\n".into()
                 } else if matches!(intent, Intent::Spectrum(_)) && !capabilities.display {
                     "ERROR Spectrum display is unavailable on this device\n".into()
                 } else if sender
@@ -279,6 +285,9 @@ mod tests {
         assert_eq!(parse("PLAY a\nPAUSE"), None);
         assert_eq!(parse("PLAY "), None);
         assert_eq!(parse("VOICE OFF"), Some(Intent::Voice(false)));
+        assert_eq!(parse("CONTROLS ON"), Some(Intent::Controls(true)));
+        assert_eq!(parse("CONTROLS OFF"), Some(Intent::Controls(false)));
+        assert!(parse("CONTROLS AUTO").is_none());
         assert_eq!(parse("SPECTRUM ON"), Some(Intent::Spectrum(true)));
         assert_eq!(parse("SPECTRUM OFF"), Some(Intent::Spectrum(false)));
         assert_eq!(parse("SPECTRUM 1"), None);

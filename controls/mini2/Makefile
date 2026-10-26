@@ -7,7 +7,9 @@ check:
 	./test-buttons
 	$(HOSTCC) $(CFLAGS) test_lights.c -o test-lights
 	./test-lights
+	$(HOSTCC) $(CFLAGS) ../test_mapped_input.c -o test-mapped-input
+	./test-mapped-input
 	$(MAKE) clean
 
 clean:
-	rm -f test-buttons test-lights
+	rm -f test-buttons test-lights test-mapped-input

@@ -50,14 +50,14 @@ case "${1:-tui}" in
             set -- --profile-info
         fi
         ;;
-    tui|addons|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|airplay|retry|release|version|help|profiles)
+    tui|addons|login|status|pause|resume|toggle|next|previous|volume|voice|controls|spectrum|airplay|retry|release|version|help|profiles|inputs|input-monitor)
         SPOTIYA_COMMAND=${1:-tui}
         [ "$#" -eq 0 ] || shift
         set -- "--$SPOTIYA_COMMAND" "$@"
         ;;
 esac
 case "${1:-}" in
-    --tui|--addons|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--airplay|--retry|--release)
+    --tui|--addons|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--controls|--spectrum|--airplay|--retry|--release)
         "$SPOTIYA_BASE/start.sh" >/dev/null
         ;;
 esac

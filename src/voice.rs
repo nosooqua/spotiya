@@ -19,6 +19,7 @@ pub enum Intent {
     Toggle,
     Volume(u16),
     Voice(bool),
+    Controls(bool),
     Spectrum(bool),
     Airplay(bool),
     Release,

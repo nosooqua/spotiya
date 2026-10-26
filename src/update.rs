@@ -112,6 +112,8 @@ fn extract(archive: &Path, destination: &Path) -> io::Result<PathBuf> {
                     | "spotiya/scripts/install.sh"
                     | "spotiya/profiles/mini1.json"
                     | "spotiya/profiles/mini2.json"
+                    | "spotiya/profiles/midi.json"
+                    | "spotiya/profiles/cucumber.json"
                     | "spotiya/profiles/generic.json"
                     | "spotiya/packaging/run.sh"
                     | "spotiya/packaging/start.sh"
@@ -382,6 +384,18 @@ mod tests {
         extract(&path, &dir.0).unwrap();
         assert_eq!(fs::read(dir.0.join("spotiya/spotiya")).unwrap(), b"abc");
         assert!(extract(&path, &dir.0).is_err());
+    }
+    #[test]
+    fn touch_profiles_are_accepted_in_release_archives() {
+        for profile in ["midi", "cucumber"] {
+            let dir =
+                Temporary::new(&std::env::temp_dir(), "spotiya-profile-archive-test").unwrap();
+            let path = dir.0.join("release.gz");
+            let file = format!("profiles/{profile}.json");
+            archive(&path, &format!("spotiya/{file}"), tar::EntryType::Regular);
+            let root = extract(&path, &dir.0).unwrap();
+            assert_eq!(fs::read(root.join(file)).unwrap(), b"abc");
+        }
     }
     #[test]
     fn archive_parent_traversal_is_rejected() {

@@ -9,6 +9,8 @@ use std::{
 
 const MINI1: &str = include_str!("../profiles/mini1.json");
 const MINI2: &str = include_str!("../profiles/mini2.json");
+const MIDI: &str = include_str!("../profiles/midi.json");
+const CUCUMBER: &str = include_str!("../profiles/cucumber.json");
 const GENERIC: &str = include_str!("../profiles/generic.json");
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -66,6 +68,7 @@ pub struct Voice {
 #[serde(rename_all = "snake_case")]
 pub enum Driver {
     Mini2,
+    Evdev,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -89,8 +92,11 @@ pub struct Controls {
     pub driver: Driver,
     pub input_device: Option<String>,
     pub input_name: Option<String>,
-    #[serde(default)]
-    pub keys: Keys,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Keys>,
+    /// Generic touch/button bindings; required by the evdev driver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<crate::input::Mapping>,
     pub ring_prefix: Option<String>,
     pub display_prefix: Option<String>,
     /// Directory of Quasar's ring patterns, played for next, previous and play/pause.
@@ -103,6 +109,8 @@ pub struct Controls {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leds: Option<crate::leds::Model>,
     pub version: u32,
     pub id: String,
     pub name: String,
@@ -116,11 +124,12 @@ pub struct Capabilities {
     pub buttons: bool,
     pub ring: bool,
     pub display: bool,
+    pub leds: bool,
     pub voice: bool,
 }
 impl Capabilities {
     pub fn controls(self) -> bool {
-        self.buttons || self.ring || self.display
+        self.buttons || self.ring || self.display || self.leds
     }
 }
 #[derive(Serialize)]
@@ -179,13 +188,42 @@ pub(crate) fn parse(text: &str) -> io::Result<Profile> {
         ));
     }
     if let Some(c) = &p.controls {
+        match c.driver {
+            Driver::Evdev => {
+                if c.input_name.is_none()
+                    || c.keys.is_some()
+                    || c.ring_prefix.is_some()
+                    || c.display_prefix.is_some()
+                    || c.ring_animations.is_some()
+                    || c.ring_colors.is_some()
+                    || c.clock_animations.is_some()
+                {
+                    return Err(invalid(
+                        "evdev requires an input name and mapping, without Mini 2 keys or lights",
+                    ));
+                }
+                c.mapping
+                    .as_ref()
+                    .ok_or_else(|| invalid("evdev requires a mapping"))?
+                    .validate()?;
+            }
+            Driver::Mini2 if c.mapping.is_some() => {
+                return Err(invalid("Use evdev for custom bindings"));
+            }
+            Driver::Mini2 => {}
+        }
         if c.input_name
             .as_ref()
             .is_some_and(|name| !valid_text(name, 128))
         {
             return Err(invalid("Invalid input device name"));
         }
-        let keys = [c.keys.alice, c.keys.volume_up, c.keys.volume_down];
+        let legacy_keys = c.keys.clone().unwrap_or_default();
+        let keys = [
+            legacy_keys.alice,
+            legacy_keys.volume_up,
+            legacy_keys.volume_down,
+        ];
         if keys.iter().any(|k| *k == 0 || *k >= 768)
             || keys[0] == keys[1]
             || keys[0] == keys[2]
@@ -229,6 +267,9 @@ fn detect(root: &Path) -> &'static str {
         {
             Some("yandexmini") => return "mini1",
             Some("yandexmini_2") => return "mini2",
+            // Retail Station 2; retail Midi is Cucumber, Max is yandexstation_2.
+            Some("yandexmidi") => return "midi",
+            Some("cucumber") => return "cucumber",
             _ => {}
         }
     }
@@ -240,31 +281,32 @@ fn detect(root: &Path) -> &'static str {
         || model.split(|b| *b == 0).next() == Some(b"Yandex Station Mini 2".as_slice())
     {
         "mini2"
+    } else if compatible
+        .split(|b| *b == 0)
+        .any(|s| s == b"yandex,station-midi")
+        || model.split(|b| *b == 0).next() == Some(b"Yandex Station Midi".as_slice())
+    {
+        "midi"
+    } else if compatible
+        .split(|b| *b == 0)
+        .any(|s| s == b"yandex,cucumber" || s == b"yandex,cucumber-dvt2")
+        || model.split(|b| *b == 0).next() == Some(b"Yandex Cucumber DVT2".as_slice())
+    {
+        "cucumber"
     } else {
         "generic"
     }
 }
 fn capabilities(p: &Profile, root: &Path) -> Capabilities {
     let mut caps = Capabilities {
+        leds: p.leds.is_some_and(|m| m.available(root)),
         voice: p.voice.is_some(),
         ..Default::default()
     };
     if let Some(c) = &p.controls {
-        caps.buttons = c.input_device.as_ref().is_some_and(|s| {
-            rooted(root, s).exists()
-                && c.input_name.as_ref().is_none_or(|expected| {
-                    Path::new(s)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|event| {
-                            fs::read_to_string(rooted(
-                                root,
-                                &format!("/sys/class/input/{event}/device/name"),
-                            ))
-                            .is_ok_and(|name| name.trim() == expected)
-                        })
-                })
-        });
+        caps.buttons =
+            crate::input::device(root, c.input_device.as_deref(), c.input_name.as_deref())
+                .is_some();
         caps.ring = c.ring_prefix.as_ref().is_some_and(|prefix| {
             ["red", "green", "blue"].iter().all(|color| {
                 (1..=6).all(|segment| {
@@ -341,6 +383,8 @@ fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolve
     let profile = match selection {
         "mini1" => parse(MINI1)?,
         "mini2" => parse(MINI2)?,
+        "midi" => parse(MIDI)?,
+        "cucumber" => parse(CUCUMBER)?,
         "generic" => parse(GENERIC)?,
         path => read_file(Path::new(path))?,
     };
@@ -373,7 +417,19 @@ impl<T> NativeAnimation<T> {
 }
 type RingAnimation = NativeAnimation<crate::animations::RingFrame>;
 type ClockAnimation = NativeAnimation<crate::animations::ClockFrame>;
-/// Mirrors `struct mini2_config` in controls/mini2/config.h.
+#[repr(C)]
+struct NativeBinding {
+    code: u32,
+    action: u32,
+    repeat: u32,
+}
+#[repr(C)]
+struct NativeGesture {
+    from: u32,
+    to: u32,
+    action: u32,
+}
+/// Mirrors `struct input_config` in controls/input_config.h.
 #[repr(C)]
 struct NativeConfig {
     input: *const c_char,
@@ -390,9 +446,18 @@ struct NativeConfig {
     clock_previous: ClockAnimation,
     clock_pause: ClockAnimation,
     volume: RingAnimation,
+    bindings: *const NativeBinding,
+    gestures: *const NativeGesture,
+    binding_count: u32,
+    gesture_count: u32,
+    gesture_ms: u32,
+    repeat_delay_ms: u32,
+    repeat_ms: u32,
+    volume_step: u32,
+    input_name: *const c_char,
 }
 unsafe extern "C" {
-    fn mini2_buttons_run(config: *const NativeConfig) -> i32;
+    fn controls_run(config: *const NativeConfig) -> i32;
 }
 impl Controls {
     pub fn run(&self, caps: Capabilities) -> io::Result<i32> {
@@ -404,7 +469,22 @@ impl Controls {
                 .transpose()
                 .map_err(|e| invalid(e.to_string()))
         }
-        let input = string(&self.input_device, caps.buttons)?;
+        let resolved_input = if caps.buttons {
+            Some(
+                crate::input::device(
+                    Path::new("/"),
+                    self.input_device.as_deref(),
+                    self.input_name.as_deref(),
+                )
+                .ok_or_else(|| invalid("Configured input device disappeared or is ambiguous"))?
+                .to_string_lossy()
+                .into_owned(),
+            )
+        } else {
+            None
+        };
+        let input = string(&resolved_input, caps.buttons)?;
+        let input_name = string(&self.input_name, caps.buttons)?;
         let ring = string(&self.ring_prefix, caps.ring)?;
         let display = string(&self.display_prefix, caps.display)?;
         let pointer = |s: &Option<CString>| s.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
@@ -420,13 +500,33 @@ impl Controls {
             (Some(directory), true) => crate::animations::Clock::load(Path::new(directory)),
             _ => crate::animations::Clock::default(),
         };
+        let mapping = self.mapping.clone().unwrap_or_default();
+        let keys = self.keys.clone().unwrap_or_default();
+        let bindings: Vec<_> = mapping
+            .bindings
+            .iter()
+            .map(|b| NativeBinding {
+                code: b.code,
+                action: b.action as u32,
+                repeat: b.repeat as u32,
+            })
+            .collect();
+        let gestures: Vec<_> = mapping
+            .gestures
+            .iter()
+            .map(|g| NativeGesture {
+                from: g.from,
+                to: g.to,
+                action: g.action as u32,
+            })
+            .collect();
         let config = NativeConfig {
             input: pointer(&input),
             ring_prefix: pointer(&ring),
             display_prefix: pointer(&display),
-            alice: self.keys.alice,
-            volume_up: self.keys.volume_up,
-            volume_down: self.keys.volume_down,
+            alice: keys.alice,
+            volume_up: keys.volume_up,
+            volume_down: keys.volume_down,
             next: NativeAnimation::of(&animations.next),
             previous: NativeAnimation::of(&animations.previous),
             pause: NativeAnimation::of(&animations.pause),
@@ -435,8 +535,17 @@ impl Controls {
             clock_previous: NativeAnimation::of(&clock.previous),
             clock_pause: NativeAnimation::of(&clock.pause),
             volume: NativeAnimation::of(&animations.volume),
+            bindings: bindings.as_ptr(),
+            gestures: gestures.as_ptr(),
+            binding_count: bindings.len() as u32,
+            gesture_count: gestures.len() as u32,
+            gesture_ms: mapping.gesture_ms,
+            repeat_delay_ms: mapping.repeat_delay_ms,
+            repeat_ms: mapping.repeat_ms,
+            volume_step: mapping.volume_step,
+            input_name: pointer(&input_name),
         };
-        Ok(unsafe { mini2_buttons_run(&config) })
+        Ok(unsafe { controls_run(&config) })
     }
 }
 
@@ -510,6 +619,128 @@ mod tests {
             assert!(!r.capabilities.voice);
         }
         assert_eq!(f.load("mini1").unwrap().profile.id, "mini1");
+    }
+    #[test]
+    fn midi_detection_uses_exact_firmware_identifiers_without_mini2_controls() {
+        for (path, data) in [
+            (
+                "/system/vendor/quasar/quasar.cfg",
+                br#"{"common":{"deviceType":"yandexmidi"}}"#.as_slice(),
+            ),
+            (
+                "/proc/device-tree/compatible",
+                b"yandex,station-midi\0amlogic, axg\0".as_slice(),
+            ),
+            (
+                "/proc/device-tree/model",
+                b"Yandex Station Midi\0".as_slice(),
+            ),
+        ] {
+            let f = Fixture::new();
+            f.file(path, data);
+            f.file("/dev/input/event0", b"");
+            f.file("/sys/class/input/event0/device/name", b"gpio-keys\n");
+            f.file("/dev/input/event1", b"");
+            f.file("/sys/class/input/event1/device/name", b"midi_touch\n");
+            f.file("/dev/fb0", b"");
+            let r = f.load("auto").unwrap();
+            assert_eq!(r.profile.id, "midi", "{path}");
+            assert_eq!(r.profile.audio.device, "default");
+            assert_eq!(r.profile.audio.mixer_device, "default");
+            assert_eq!(r.profile.audio.mixer_control, "Master");
+            assert!(matches!(r.profile.audio.mixer_channel, Channel::Mono));
+            assert_eq!(
+                r.profile.voice.unwrap().address,
+                "127.0.0.1:9875".parse().unwrap()
+            );
+            assert!(r.capabilities.voice);
+            assert!(matches!(r.profile.controls.unwrap().driver, Driver::Evdev));
+            assert!(r.capabilities.buttons);
+            assert!(!r.capabilities.ring && !r.capabilities.display);
+        }
+    }
+    #[test]
+    fn evdev_profiles_reject_missing_mapping_and_mini2_visuals() {
+        let original: serde_json::Value = serde_json::from_str(MIDI).unwrap();
+        for (path, value) in [
+            ("/controls/mapping", serde_json::Value::Null),
+            ("/controls/input_name", serde_json::Value::Null),
+            ("/controls/driver", serde_json::json!("mini2")),
+        ] {
+            let mut p = original.clone();
+            *p.pointer_mut(path).unwrap() = value;
+            assert!(parse(&p.to_string()).is_err(), "{path}");
+        }
+        let mut p = original;
+        p["controls"]["ring_prefix"] = serde_json::json!("/sys/class/leds/mini2:");
+        assert!(parse(&p.to_string()).is_err());
+    }
+    #[test]
+    fn cucumber_detection_uses_firmware_identifiers_and_its_own_input() {
+        for (path, data) in [
+            (
+                "/system/vendor/quasar/quasar.cfg",
+                br#"{"common":{"deviceType":"cucumber"}}"#.as_slice(),
+            ),
+            (
+                "/proc/device-tree/compatible",
+                b"yandex,cucumber\0amlogic, a5\0".as_slice(),
+            ),
+            (
+                "/proc/device-tree/compatible",
+                b"yandex,cucumber-dvt2\0".as_slice(),
+            ),
+            (
+                "/proc/device-tree/model",
+                b"Yandex Cucumber DVT2\0".as_slice(),
+            ),
+        ] {
+            let f = Fixture::new();
+            f.file(path, data);
+            f.file("/dev/input/event2", b"");
+            f.file("/sys/class/input/event2/device/name", b"mute\n");
+            f.file("/dev/input/event3", b"");
+            f.file("/sys/class/input/event3/device/name", b"awinic_sar\n");
+            let r = f.load("auto").unwrap();
+            assert_eq!(r.profile.id, "cucumber", "{path}");
+            assert_eq!(r.profile.audio.device, "default");
+            assert!(matches!(r.profile.audio.mixer_channel, Channel::FrontLeft));
+            assert!(r.capabilities.buttons && r.capabilities.voice);
+            assert!(!r.capabilities.ring && !r.capabilities.display);
+            let controls = r.profile.controls.unwrap();
+            assert_eq!(controls.input_name.as_deref(), Some("awinic_sar"));
+            assert!(matches!(controls.driver, Driver::Evdev));
+            // Other input devices must not stand in for a missing touch sensor.
+            fs::remove_file(rooted(&f.0, "/dev/input/event3")).unwrap();
+            assert!(!f.load("auto").unwrap().capabilities.buttons);
+        }
+    }
+    #[test]
+    fn max_and_partial_names_remain_generic() {
+        for (device, compatible, model) in [
+            (
+                "cucumber_pro",
+                "yandex,cucumber-pro",
+                "Yandex Cucumber DVT2 Pro",
+            ),
+            ("yandexstation_2", "", "Yandex Station Max"),
+            (
+                "yandexmidi_2",
+                "yandex,station-midi-other",
+                "Yandex Station Midi Pro",
+            ),
+        ] {
+            let f = Fixture::new();
+            f.file(
+                "/system/vendor/quasar/quasar.cfg",
+                serde_json::json!({"common":{"deviceType":device}}).to_string(),
+            );
+            f.file("/proc/device-tree/compatible", format!("{compatible}\0"));
+            f.file("/proc/device-tree/model", format!("{model}\0"));
+            let r = f.load("auto").unwrap();
+            assert_eq!(r.profile.id, "generic", "{device}");
+            assert!(!r.capabilities.voice);
+        }
     }
     #[test]
     fn mini2_detection_probes_whole_devices_and_separates_capabilities() {

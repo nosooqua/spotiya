@@ -65,7 +65,7 @@ pub fn read(state: &Path) -> io::Result<Option<Saved>> {
         saved.profile = Some(profiles::parse(&serde_json::to_string(&p)?)?);
     } else if !matches!(
         saved.selection.as_str(),
-        "auto" | "mini1" | "mini2" | "generic"
+        "auto" | "mini1" | "mini2" | "midi" | "cucumber" | "generic"
     ) {
         return Err(invalid("Unknown saved profile"));
     }
@@ -89,6 +89,12 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
             "Yandex Station Mini 2",
             "Mini 2 controls and Quasar IPC",
         ),
+        ("midi", "Yandex Station 2", "Station 2 audio and Quasar IPC"),
+        (
+            "cucumber",
+            "Yandex Station Midi",
+            "Midi touch controls and Quasar IPC",
+        ),
         ("generic", "Generic ALSA", "Audio only"),
     ] {
         out.push(Choice {
@@ -111,7 +117,13 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
                 if path.extension().is_none_or(|s| s != "json")
                     || matches!(
                         path.file_name().and_then(|s| s.to_str()),
-                        Some("mini1.json" | "mini2.json" | "generic.json")
+                        Some(
+                            "mini1.json"
+                                | "mini2.json"
+                                | "midi.json"
+                                | "cucumber.json"
+                                | "generic.json"
+                        )
                     )
                 {
                     continue;
@@ -154,12 +166,15 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
     Ok(out)
 }
 pub fn resolve(state: &Path, selection: &str) -> io::Result<Saved> {
-    let selection = if selection == "yandexmini" {
-        "mini1"
-    } else {
-        selection
+    let selection = match selection {
+        "yandexmini" => "mini1",
+        "yandexmidi" => "midi",
+        other => other,
     };
-    if matches!(selection, "auto" | "mini1" | "mini2" | "generic") {
+    if matches!(
+        selection,
+        "auto" | "mini1" | "mini2" | "midi" | "cucumber" | "generic"
+    ) {
         return Ok(Saved {
             version: 1,
             selection: selection.into(),
@@ -349,6 +364,41 @@ mod tests {
             1
         );
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn touch_profile_selection_persists_and_takes_precedence_over_custom_ids() {
+        for (id, selections, json) in [
+            (
+                "midi",
+                vec!["midi", "yandexmidi"],
+                include_str!("../profiles/midi.json"),
+            ),
+            (
+                "cucumber",
+                vec!["cucumber"],
+                include_str!("../profiles/cucumber.json"),
+            ),
+        ] {
+            let root = fixture();
+            let state = root.join("state");
+            fs::create_dir(&state).unwrap();
+            let directory = root.join("profiles");
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join(format!("{id}.json")), json).unwrap();
+            fs::write(directory.join("custom.json"), json).unwrap();
+            for selection in selections {
+                let saved = resolve(&state, selection).unwrap();
+                assert_eq!(saved.selection, id);
+                assert!(saved.profile.is_none());
+                transaction(&state, &saved, |_| Ok(())).unwrap();
+                assert_eq!(read(&state).unwrap().unwrap().selection, id);
+                assert_eq!(profiles::load(None, &state).unwrap().profile.id, id);
+            }
+            let choices = choices(&state).unwrap();
+            assert_eq!(choices.iter().filter(|c| c.key() == id).count(), 1);
+            assert_eq!(choices.iter().filter(|c| c.id() == id).count(), 2);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
     #[test]
     fn selection_persists_and_custom_profiles_are_imported_as_snapshots() {

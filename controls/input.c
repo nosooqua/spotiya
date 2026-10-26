@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include "config.h"
+#include "input_config.h"
 
 enum action { TOGGLE, NEXT, PREV, LOUDER, QUIETER };
 enum { GESTURE_US = 250000, REPEAT_DELAY_US = 450000, REPEAT_US = 180000 };
@@ -92,6 +92,8 @@ static void key_event(struct gesture *g, unsigned code, int value, int64_t now) 
     }
 }
 
+#include "mapped_input.h"
+
 #ifndef BUTTON_TEST
 #include <errno.h>
 #include <fcntl.h>
@@ -101,12 +103,14 @@ static void key_event(struct gesture *g, unsigned code, int value, int64_t now) 
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-#include "lights.h"
-#include "display.h"
+#include "mini2/lights.h"
+#include "mini2/display.h"
 
 #define EVIOCGRAB 0x40044590UL
 #define EVIOCGKEY96 0x80604518UL
 #define EVIOCSCLOCKID 0x400445a0UL
+#define EVIOCGNAME128 0x80804506UL
+#define EVIOCGBIT_KEY96 0x80604521UL
 struct input_event_abi {
     long sec, usec;
     uint16_t type, code;
@@ -134,11 +138,13 @@ static int64_t now_us(clockid_t clock) {
     return (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
 }
 extern int mini2_receiver_status(int *paused, int *volume);
-extern int mini2_receiver_command(int action);
+extern int controls_receiver_command(int action, unsigned step);
 extern int mini2_receiver_running(void);
 extern int mini2_receiver_spectrum(unsigned char *levels);
 static int spotify_active(void) { return mini2_receiver_status(&current_paused, &current_volume); }
-static int command(enum action a) { return mini2_receiver_command((int)a); }
+static int command(enum action a) {
+    return controls_receiver_command((int)a, control_config.volume_step);
+}
 static void earliest(int64_t *wake, int64_t at) {
     if (at && at < *wake)
         *wake = at;
@@ -149,16 +155,44 @@ static int empty_keys(const unsigned char *keys) {
             return 0;
     return 1;
 }
-int mini2_buttons_run(const struct mini2_config *config) {
+int controls_run(const struct input_config *config) {
     if (!config)
         return 1;
     control_config = *config;
-    /* Without O_CLOEXEC, helpers such as playplay-decoder inherit the grab. */
+    if (control_config.binding_count > 32 || control_config.gesture_count > 32 ||
+        (control_config.binding_count && !control_config.bindings) ||
+        (control_config.gesture_count && !control_config.gestures))
+        return 1;
+    /* Without O_CLOEXEC, child processes inherit the grab. */
     int fd =
         control_config.input ? open(control_config.input, O_RDONLY | O_NONBLOCK | O_CLOEXEC) : -1;
     if (control_config.input && fd < 0) {
         note("buttons: input open failed\n");
         return 1;
+    }
+    if (fd >= 0 && control_config.input_name) {
+        char name[128] = {0};
+        if (ioctl(fd, EVIOCGNAME128, name) < 0 ||
+            strncmp(name, control_config.input_name, sizeof name) != 0) {
+            note("buttons: input device name changed\n");
+            close(fd);
+            return 1;
+        }
+    }
+    if (fd >= 0 && control_config.binding_count) {
+        unsigned char keys[96] = {0};
+        if (ioctl(fd, EVIOCGBIT_KEY96, keys) < 0) {
+            close(fd);
+            return 1;
+        }
+        for (unsigned i = 0; i < control_config.binding_count; i++) {
+            unsigned code = control_config.bindings[i].code;
+            if (code >= 768 || !(keys[code / 8] & (1u << (code % 8)))) {
+                note("buttons: configured key is not supported by this input device\n");
+                close(fd);
+                return 1;
+            }
+        }
     }
     /* Gesture deadlines compare event times with the clock; NTP steps the realtime one. */
     clockid_t event_clock = CLOCK_MONOTONIC;
@@ -166,10 +200,11 @@ int mini2_buttons_run(const struct mini2_config *config) {
     if (fd >= 0 && ioctl(fd, EVIOCSCLOCKID, &monotonic) < 0)
         event_clock = CLOCK_REALTIME;
     struct gesture g = {0};
+    struct mapped_input mapped = {0};
     struct lights lights = {0};
     struct display display = {0};
     unsigned char held[96] = {0}, actual[96];
-    int grabbed = 0, wanted = 0;
+    int grabbed = 0, wanted = 0, syncing = 0;
     int64_t probe_at = 0;
     struct input_event_abi events[64];
     note(fd >= 0 ? "buttons: ready (Alice control until Spotify is active)\n"
@@ -208,8 +243,17 @@ int mini2_buttons_run(const struct mini2_config *config) {
                     grabbed = 0;
                     queued = 0;
                     memset(&g, 0, sizeof g);
-                    if (ioctl(fd, EVIOCGKEY96, held) < 0)
-                        memset(held, 0, sizeof held);
+                    mapped_reset(&mapped);
+                    syncing = 1;
+                } else if (syncing) {
+                    if (e->type == 0 && e->code == 0) {
+                        if (ioctl(fd, EVIOCGKEY96, held) < 0) {
+                            note("buttons: key resync failed\n");
+                            running = 0;
+                            break;
+                        }
+                        syncing = 0;
+                    }
                 } else if (e->type == 1) {
                     if (e->code < 768) {
                         unsigned char mask = (unsigned char)(1u << (e->code % 8));
@@ -218,8 +262,13 @@ int mini2_buttons_run(const struct mini2_config *config) {
                         else
                             held[e->code / 8] &= (unsigned char)~mask;
                     }
-                    if (grabbed && wanted)
-                        key_event(&g, e->code, e->value, (int64_t)e->sec * 1000000 + e->usec);
+                    if (grabbed && wanted) {
+                        int64_t at = (int64_t)e->sec * 1000000 + e->usec;
+                        if (control_config.binding_count)
+                            mapped_event(&mapped, e->code, e->value, at);
+                        else
+                            key_event(&g, e->code, e->value, at);
+                    }
                 }
             }
         }
@@ -227,7 +276,7 @@ int mini2_buttons_run(const struct mini2_config *config) {
             note("buttons: input read failed\n");
             break;
         }
-        if (fd >= 0 && wanted != grabbed && empty_keys(held)) {
+        if (fd >= 0 && !syncing && wanted != grabbed && empty_keys(held)) {
             /* EVIOCGKEY returns the bitmap length on success, not zero. */
             int released = !wanted || (ioctl(fd, EVIOCGKEY96, actual) >= 0 && empty_keys(actual));
             if (released) {
@@ -238,11 +287,16 @@ int mini2_buttons_run(const struct mini2_config *config) {
                 grabbed = wanted;
                 queued = 0;
                 memset(&g, 0, sizeof g);
+                mapped_reset(&mapped);
                 note(grabbed ? "buttons: Spotify control\n" : "buttons: Alice control\n");
             }
         }
-        if (grabbed && wanted)
-            tick(&g, now_us(event_clock));
+        if (grabbed && wanted) {
+            if (control_config.binding_count)
+                mapped_tick(&mapped, now_us(event_clock));
+            else
+                tick(&g, now_us(event_clock));
+        }
         for (size_t i = 0; i < queued && wanted && running; i++) {
             if (now_us(CLOCK_MONOTONIC) >= probe_at) {
                 wanted = spotify_active();
@@ -295,7 +349,8 @@ int mini2_buttons_run(const struct mini2_config *config) {
             } else if (spectrum)
                 earliest(&wake, display.yield_until > now ? display.yield_until : now + 50000);
             if (grabbed) {
-                int64_t gesture = gesture_deadline(&g);
+                int64_t gesture =
+                    control_config.binding_count ? mapped_deadline(&mapped) : gesture_deadline(&g);
                 /* Gesture times use the event clock; shift them onto the monotonic one. */
                 if (gesture)
                     earliest(&wake, gesture - now_us(event_clock) + now);

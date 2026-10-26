@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define BUTTON_TEST
-#include "buttons.c"
+#include "../input.c"
 #include <assert.h>
 #include <fcntl.h>
 #include <stdio.h>

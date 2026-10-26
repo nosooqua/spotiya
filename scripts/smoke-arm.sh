@@ -8,7 +8,8 @@ SPOTIYA_ALSA_SYSROOT=${SPOTIYA_ALSA_SYSROOT:-"$SPOTIYA_CACHE/alsa-sysroot-glibc2
 SPOTIYA_QEMU=${SPOTIYA_QEMU:-qemu-arm}
 SPOTIYA_BINARY=${1:-"$SPOTIYA_ROOT/${CARGO_TARGET_DIR:-target}/armv7-unknown-linux-gnueabihf/release/spotiya"}
 SPOTIYA_OUTPUT=$(mktemp)
-trap 'rm -f "$SPOTIYA_OUTPUT"' EXIT HUP INT TERM
+SPOTIYA_STATE=$(mktemp -d)
+trap 'rm -f "$SPOTIYA_OUTPUT"; rm -rf "$SPOTIYA_STATE"' EXIT HUP INT TERM
 
 run() {
     "$SPOTIYA_QEMU" -L "$SPOTIYA_TOOLCHAIN/arm-linux-gnueabihf/libc" \
@@ -30,6 +31,23 @@ expect 'spotiya --play QUERY'
 run --profiles
 expect 'mini1 '
 expect 'mini2 '
+expect 'midi '
+expect 'cucumber '
+run --profile midi --profile-info
+expect '"id": "midi"'
+run --profile cucumber --profile-info
+expect '"id": "cucumber"'
+run --state-dir "$SPOTIYA_STATE" --profile midi --device-name
+expect '"spotify": "Yandex Station 2"'
+expect '"airplay": "Yandex Station 2"'
+run --state-dir "$SPOTIYA_STATE" --profile midi --device-name 'Living room'
+expect '"spotify": "Living room"'
+run --state-dir "$SPOTIYA_STATE" --profile cucumber --device-name airplay 'AirPlay room'
+expect '"spotify": "Living room"'
+expect '"airplay": "AirPlay room"'
+run --state-dir "$SPOTIYA_STATE" --profile cucumber --device-name reset
+expect '"spotify": "Yandex Station Midi"'
+expect '"airplay": "Yandex Station Midi"'
 if run --no-such-option; then
     echo 'Smoke test: an unknown option was accepted' >&2
     exit 1

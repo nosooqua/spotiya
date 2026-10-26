@@ -45,14 +45,14 @@ def main():
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
     parser.add_argument("command", nargs="?", default="tui", choices=(
         "tui", "addons", "addon", "airplay", "login", "status", "play", "pause", "resume", "toggle", "next",
-        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "name", "profile", "profiles", "doctor", "update"))
+        "previous", "volume", "voice", "controls", "spectrum", "retry", "release", "start", "stop", "restart", "version", "name", "profile", "profiles", "inputs", "input-monitor", "doctor", "update"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
     if args.command == "play":
         if not args.value:
             parser.error("play needs a song or artist")
         value = [" ".join(args.value)]
-    elif args.command in ("volume", "voice", "spectrum", "airplay"):
+    elif args.command in ("volume", "voice", "controls", "spectrum", "airplay", "input-monitor"):
         if len(args.value) != 1:
             parser.error(args.command + " needs one value")
         value = args.value
@@ -100,7 +100,7 @@ def main():
     interactive = args.command in ("tui", "addons")
     if interactive and not sys.stdin.isatty():
         parser.error(args.command + " needs an interactive terminal")
-    if args.command not in ("status", "version", "name", "profile", "profiles", "doctor", "update", "addon"):
+    if args.command not in ("status", "version", "name", "profile", "profiles", "inputs", "input-monitor", "doctor", "update", "addon"):
         start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
             sys.exit(start.stdout.strip() or "Unable to start receiver")

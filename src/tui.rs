@@ -407,7 +407,7 @@ fn dashboard(
         .collect();
     lines.truncate(5);
     // Title, artist, gap, progress, gap, then the messages.
-    let middle_h = 2 + titles.len() + details.len() + 3 + lines.len().max(1);
+    let middle_h = (2 + titles.len() + details.len() + 3 + lines.len().max(1)).max(8);
     let left = Area {
         x: 0,
         y: header.h,
@@ -426,7 +426,7 @@ fn dashboard(
             x: 0,
             y: header.h + middle_h,
             w: width,
-            h: 7,
+            h: 8,
         }
     };
     // Now playing.
@@ -544,6 +544,15 @@ fn dashboard(
         ("idle", screen::DIM)
     };
     feature(&mut c, inner, 4, "alice", value, colour);
+    let (value, colour) = toggle(status.controls_supported, status.controls);
+    feature(
+        &mut c,
+        inner,
+        5,
+        "controls",
+        &format!("{value} [b]"),
+        colour,
+    );
     // Spectrum history fills the rest of the screen.
     let top = right.y + right.h;
     let rest = height.saturating_sub(top);
@@ -1166,6 +1175,17 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                 b'p' => Some("PREVIOUS".to_owned()),
                 b'+' | b'=' => Some(format!("VOLUME {}", (status.volume + 5).min(100))),
                 b'-' => Some(format!("VOLUME {}", status.volume.saturating_sub(5))),
+                b'b' => {
+                    if status.controls_supported {
+                        Some(format!(
+                            "CONTROLS {}",
+                            if status.controls { "OFF" } else { "ON" }
+                        ))
+                    } else {
+                        notice = "Physical controls are unavailable in this device profile".into();
+                        None
+                    }
+                }
                 b'v' => {
                     if status.voice_supported {
                         Some(format!("VOICE {}", if status.voice { "OFF" } else { "ON" }))
@@ -1319,8 +1339,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("spotiya-menu-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let mut menu = ProfileMenu::new(&root, "auto").unwrap();
-        for key in b"\x1b[B\x1b[B\x1b[B" {
-            assert!(menu.key(*key).is_none());
+        for _ in 1..menu.entries.len() {
+            for key in b"\x1b[B" {
+                assert!(menu.key(*key).is_none());
+            }
         }
         assert_eq!(menu.entries[menu.selected].key(), "generic");
         assert!(
@@ -1409,6 +1431,26 @@ mod tests {
         assert!(has(&rows(&status, "", 90, 24), "● PREMIUM REQUIRED"));
         status.login_refused.clear();
         assert!(has(&rows(&status, "", 90, 24), "● CONNECTING"));
+    }
+    #[test]
+    fn controls_toggle_and_hotkey_are_visible_without_overlapping_the_label() {
+        for (supported, enabled, expected) in [
+            (false, false, "n/a [b]"),
+            (true, false, "off [b]"),
+            (true, true, "on [b]"),
+        ] {
+            let status = Status {
+                controls_supported: supported,
+                controls: enabled,
+                ..Default::default()
+            };
+            let frame = rows(&status, "", 80, 24);
+            assert!(
+                frame
+                    .iter()
+                    .any(|row| row.contains("controls") && row.contains(expected))
+            );
+        }
     }
     #[test]
     fn spectrum_state_is_visible_for_supported_and_other_devices() {

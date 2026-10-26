@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use std::{fs, io::Read, path::Path};
 
-/// Mirrors `struct ring_frame` in controls/mini2/config.h.
+/// Mirrors `struct ring_frame` in controls/input_config.h.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingFrame {
@@ -14,7 +14,7 @@ pub struct RingFrame {
     pub ms: u16,
 }
 
-/// Mirrors `struct display_frame` in controls/mini2/config.h.
+/// Mirrors `struct display_frame` in controls/input_config.h.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockFrame {

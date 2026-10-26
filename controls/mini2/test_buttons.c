@@ -1,5 +1,5 @@
 #define BUTTON_TEST
-#include "buttons.c"
+#include "../input.c"
 #include <assert.h>
 #include <stdio.h>
 
