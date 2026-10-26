@@ -57,6 +57,8 @@ mod supervisor;
 mod tui;
 mod update;
 mod voice;
+mod voice_recovery;
+mod voice_start;
 mod volume_guard;
 mod volume_sound;
 
@@ -70,6 +72,7 @@ const VOICE_EXPIRY: Duration = Duration::from_secs(5);
 struct Prepare {
     intent: voice::Intent,
     from_voice: bool,
+    request_id: Option<String>,
     received: Instant,
     epoch: u64,
 }
@@ -892,10 +895,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut events = player.get_player_event_channel();
     let (voice_tx, mut voice_rx) = mpsc::channel(8);
+    let activation = Arc::new(voice_recovery::Activation::default());
     let voice_watch = native.map(|address| {
         tokio::spawn(voice::watch(
             voice_tx.clone(),
             shared.ducking.clone(),
+            activation.clone(),
             address,
         ))
     });
@@ -923,9 +928,21 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let (prepared_tx, mut prepared_rx) = mpsc::channel::<(Prepare, bool)>(8);
     let native_worker = tokio::spawn(async move {
         while let Some(request) = native_rx.recv().await {
-            let prepared = voice::prepare_playback(native, request.from_voice)
-                .await
-                .is_ok();
+            if request.received.elapsed() > VOICE_EXPIRY {
+                continue;
+            }
+            let lease = activation.lease(request.request_id.as_deref());
+            let prepared =
+                voice::prepare_playback(native, request.from_voice, request.request_id.as_deref())
+                    .await
+                    .is_ok();
+            if prepared
+                && request.from_voice
+                && let (Some(address), Some(lease)) = (native, lease)
+            {
+                let activation = activation.clone();
+                tokio::spawn(activation.restore(lease, move || voice::start_activation(address)));
+            }
             if prepared_tx.send((request, prepared)).await.is_err() {
                 break;
             }
@@ -933,6 +950,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     });
     // Bumped whenever the Spotify connection or ownership changes, so queued intents expire.
     let mut voice_epoch = 0u64;
+    let mut voice_start = voice_start::Launcher::<LoadRequest>::default();
     let audio_guard = Arc::new(audio_guard::AudioGuard::new());
     let audio_worker = native.map(|address| {
         let guard = audio_guard.clone();
@@ -1031,7 +1049,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             _=tokio::signal::ctrl_c()=>break,
             fresh=discovery.next()=>{
                 let Some(fresh)=fresh else { eprintln!("receiver: discovery stopped"); break; };
-                audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
+                audio_guard.set_playing(false);connecting=None;voice_epoch+=1;voice_start.reset();
                 if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by another Spotify device"));}
                 fallback=None;rejected=None;
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
@@ -1039,7 +1057,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 credentials=Some(fresh); retry_at=Instant::now(); backoff=5;
             },
             Some(login)=login_rx.recv()=>{
-                audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
+                audio_guard.set_playing(false);connecting=None;voice_epoch+=1;voice_start.reset();
                 if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by a newer login"));}
                 else {fallback=credentials.take();}
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
@@ -1064,10 +1082,9 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     Some(Ok((handle,future)))=>{
                         spirc=Some(handle);task=Some(tokio::spawn(future));backoff=5;fallback=None;eprintln!("receiver: Spotify connected");
                         if let Some(reply)=pending_login.take(){let _=reply.send(Ok(()));}
-                        if let Some(uri)=retry_track.take() && let Some(handle)=spirc.as_ref() {
-                            let _=handle.activate();
+                        if let Some(uri)=retry_track.take() {
                             let request=LoadRequest::from_tracks(vec![uri],LoadRequestOptions{start_playing:true,..Default::default()});
-                            let _=handle.load(request);
+                            playback.clear_start_error();voice_start.begin(request);
                         }
                     },
                     Some(Err(e))=>{
@@ -1087,14 +1104,20 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             _=async {if let Some(task)=task.as_mut(){let _=task.await;}}, if task.is_some()=>{
-                spirc=None;task=None;session.shutdown();playback.reset();voice_epoch+=1;
+                spirc=None;task=None;session.shutdown();playback.reset();voice_epoch+=1;voice_start.reset();
                 retry_at=Instant::now()+Duration::from_secs(5);eprintln!("receiver: reconnect scheduled");
             },
             Some(event)=events.recv()=>{
+                match &event {
+                    PlayerEvent::SessionConnected{..}=>voice_start.session(true),
+                    PlayerEvent::SessionDisconnected{..}=>voice_start.session(false),
+                    PlayerEvent::PlayRequestIdChanged{..}=>voice_start.loading(),
+                    _=>{},
+                }
                 if failures.blocked() || !playback.update(&event) {continue;}
                 if failures.observe(&event) {
                     log::warn!("receiver: {}",failures.message());
-                    audio_guard.set_playing(false);player.stop();voice_epoch+=1;
+                    audio_guard.set_playing(false);player.stop();voice_epoch+=1;voice_start.reset();
                     stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                     while events.try_recv().is_ok() {}
                 }
@@ -1127,6 +1150,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let accepted = if request.reply.is_closed() || !airplay.valid(&request.token) { false } else {
                     match request.action {
                         airplay::Action::Begin => {
+                            voice_start.cancel();voice_epoch+=1;
                             shared.airplay.active.store(true,Ordering::Release);
                             if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
                             player.stop();playback.reset();
@@ -1150,6 +1174,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             Some(command)=command_rx.recv()=>{
                 if std::time::Instant::now()>=command.deadline || !shared.controls_enabled.load(Ordering::Acquire) {continue;}
                 let airplay_was_active = shared.airplay.active.load(Ordering::Acquire);
+                if matches!(command.action,0..=2) {voice_start.cancel();voice_epoch+=1;}
                 let step=command.volume_step as i32;
                 let ok=if shared.airplay.active.load(Ordering::Acquire) {
                     if command.action==0 {airplay.stop(&shared.airplay).await;true}
@@ -1185,6 +1210,11 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             Some(event)=voice_rx.recv()=>{
                 if event.received.elapsed()>VOICE_EXPIRY {continue;}
                 if event.from_voice && !voice_enabled {continue;}
+                // Wake-word-free commands control only an owned playback session.
+                // The watcher excludes commands issued during an existing dialog.
+                if event.quick && (!shared.active.load(Ordering::Acquire)
+                    || (shared.airplay.active.load(Ordering::Acquire)
+                        && !matches!(event.intent, voice::Intent::Pause))) {continue;}
                 let intent=match event.intent {
                     voice::Intent::Airplay(enabled)=>{
                         if let Err(e)=airplay.set_enabled(enabled){eprintln!("airplay: {e}");}
@@ -1236,7 +1266,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     voice::Intent::Release=>{
                         if shared.airplay.active.load(Ordering::Acquire) {airplay.stop(&shared.airplay).await;}
                         if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
-                        voice_epoch+=1;
+                        voice_epoch+=1;voice_start.cancel();
                         playback.reset();shared.paused.store(false,Ordering::Relaxed);
                         shared.active.store(false,Ordering::Release);audio_guard.set_playing(false);
                         continue;
@@ -1261,7 +1291,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     voice::Intent::Resume if !active && last_track.is_some()=>true,
                     _=>active,
                 };
-                let request=Prepare{intent,from_voice:event.from_voice,received:event.received,epoch:voice_epoch};
+                voice_start.cancel();voice_epoch+=1;
+                let request=Prepare{intent,from_voice:event.from_voice,request_id:event.request_id,received:event.received,epoch:voice_epoch};
                 if wanted && native_tx.try_send(request).is_err() {eprintln!("voice: native command queue is full");}
             },
             Some((request,prepared))=prepared_rx.recv()=>{
@@ -1272,15 +1303,15 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 match intent {
                     voice::Intent::Play(query)=>{
                         if !prepared {eprintln!("voice: could not cancel native conversation");continue;}
-                        let _=handle.activate();
                         let request=LoadRequest::from_context_uri(voice::context(&query),LoadRequestOptions{start_playing:true,..Default::default()});
-                        if handle.load(request).is_ok() {eprintln!("voice: Spotify music query queued");}
+                        playback.clear_start_error();voice_start.begin(request);
+                        eprintln!("voice: Spotify music query pending activation");
                     },
                     voice::Intent::Resume if !shared.active.load(Ordering::Acquire) && last_track.is_some()=>{
                         if !prepared {continue;}
-                        let _=handle.activate();
                         let request=LoadRequest::from_tracks(vec![last_track.clone().unwrap()],LoadRequestOptions{start_playing:true,..Default::default()});
-                        if handle.load(request).is_ok() {eprintln!("voice: last Spotify track queued");}
+                        playback.clear_start_error();voice_start.begin(request);
+                        eprintln!("voice: last Spotify track pending activation");
                     },
                     intent if shared.active.load(Ordering::Acquire)=>{
                         match intent {
@@ -1321,6 +1352,23 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if player.is_invalid() {eprintln!("receiver: audio worker stopped");break;}
             },
+        }
+        if let Some(action) = voice_start.poll() {
+            let result = match (action, spirc.as_ref()) {
+                (voice_start::Action::Activate, Some(handle)) => handle.activate().map_err(|_| ()),
+                (voice_start::Action::Load(request), Some(handle)) => {
+                    eprintln!("voice: activation acknowledged; loading Spotify request");
+                    handle.load(request).map_err(|_| ())
+                }
+                _ => Err(()),
+            };
+            if result.is_err() {
+                voice_start.cancel();
+                playback.fail_start();
+                eprintln!(
+                    "voice: Spotify did not start the requested playback; voice activation remains available"
+                );
+            }
         }
         let playing = playback.playing() || shared.airplay.active.load(Ordering::Acquire);
         audio_guard.set_playing(playing);

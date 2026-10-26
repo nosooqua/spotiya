@@ -29,6 +29,8 @@ pub struct Event {
     pub intent: Intent,
     pub received: Instant,
     pub from_voice: bool,
+    pub quick: bool,
+    pub request_id: Option<String>,
 }
 
 pub fn intent(text: &str) -> Option<Intent> {
@@ -258,6 +260,29 @@ fn recognized(data: &[u8]) -> Option<(String, String)> {
     }
     Some((request.to_owned(), text.to_owned()))
 }
+// Spotter notifications are separate from Alice's ASR. Only the native command
+// capability's onPhraseSpotted notification is accepted; activation words,
+// playback RPCs (including our own audio guard), and arbitrary text are ignored.
+fn quick_command(data: &[u8]) -> Option<Intent> {
+    if number(data, 253) != Some(210) {
+        return None;
+    }
+    let remoting = bytes(data, 252)?;
+    if bytes(remoting, 7)? != b"CommandSpotterCapability" {
+        return None;
+    }
+    let notification = bytes(remoting, 15)?;
+    if number(notification, 1) != Some(2) {
+        return None;
+    }
+    match std::str::from_utf8(bytes(notification, 3)?).ok()? {
+        "стоп" | "пауза" | "хватит" => Some(Intent::Pause),
+        "дальше" | "следующий" => Some(Intent::Next),
+        "назад" => Some(Intent::Previous),
+        "продолжи" | "играй" => Some(Intent::Resume),
+        _ => None,
+    }
+}
 fn put_var(out: &mut Vec<u8>, mut v: u64) {
     while v >= 128 {
         out.push((v as u8 & 127) | 128);
@@ -285,9 +310,20 @@ fn rpc(capability: &str, field: u64, method: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&message);
     frame
 }
-pub async fn cancel_alice(address: SocketAddr) -> io::Result<()> {
-    // Native CLI 'c': AliceCapabilityMethod kind 3, cancel the conversation.
-    send_native(address, rpc("AliceCapability", 8, &[8, 3])).await
+pub async fn cancel_alice(address: SocketAddr, request_id: Option<&str>) -> io::Result<()> {
+    // AliceCapabilityProxy::cancelDialog(false, requestId), verified against firmware.
+    // Kind 3 is stopConversation: during final ASR it can leave the phrase spotter
+    // stopped even after Alice reports IDLE. Kind 1 cancels the request normally.
+    let mut method = vec![8, 1];
+    put_number(&mut method, 7, 0);
+    if let Some(request_id) = request_id {
+        put_bytes(&mut method, 10, request_id.as_bytes());
+    }
+    send_native(address, rpc("AliceCapability", 8, &method)).await
+}
+pub async fn start_activation(address: SocketAddr) -> io::Result<()> {
+    // ActivationSpotterCapability::start(), not enable(): native mute/disabled checks remain.
+    send_native(address, rpc("ActivationSpotterCapability", 14, &[8, 2])).await
 }
 pub async fn pause_native(address: SocketAddr) -> io::Result<()> {
     // Native CLI 'o': PlaybackControlCapabilityMethod kind 1 (pause).
@@ -302,10 +338,14 @@ pub async fn pause_native(address: SocketAddr) -> io::Result<()> {
     put_number(&mut method, 7, 0);
     send_native(address, rpc("PlaybackControlCapability", 13, &method)).await
 }
-pub async fn prepare_playback(address: Option<SocketAddr>, from_voice: bool) -> io::Result<()> {
+pub async fn prepare_playback(
+    address: Option<SocketAddr>,
+    from_voice: bool,
+    request_id: Option<&str>,
+) -> io::Result<()> {
     if let Some(address) = address {
-        if from_voice {
-            cancel_alice(address).await?;
+        if from_voice && request_id.is_some() {
+            cancel_alice(address, request_id).await?;
         }
         let _ = pause_native(address).await;
     }
@@ -332,9 +372,12 @@ async fn read_events(
     socket: &mut (impl tokio::io::AsyncRead + Unpin),
     sender: &mpsc::Sender<Event>,
     ducking: &crate::ducking::Ducking,
+    activation: &crate::voice_recovery::Activation,
     seen: &mut VecDeque<String>,
 ) -> io::Result<()> {
     let mut data = Vec::with_capacity(4096);
+    let mut latest_request: Option<String> = None;
+    let mut pending_quick: Option<Event> = None;
     loop {
         let size = socket.read_u32_le().await? as usize;
         if size == 0 || size > MAX_FRAME {
@@ -347,11 +390,40 @@ async fn read_events(
         socket.read_exact(&mut data).await?;
         if let Some(busy) = alice_busy(&data) {
             ducking.set_busy(busy);
+            let state = bytes(&data, 252).unwrap_or_default();
+            let idle = match number(state, 1).unwrap_or(0) {
+                0 => Some(true),
+                1 | 2 | 3 | 5 => Some(false),
+                _ => None,
+            };
+            let request = bytes(state, 7)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .filter(|s| !s.is_empty());
+            activation.observe(idle, request);
+            latest_request = request.filter(|s| s.len() == 36).map(str::to_owned);
+            if pending_quick.as_ref().is_some_and(|event| {
+                event.received.elapsed() >= Duration::from_secs(2)
+                    || event.request_id.as_deref() != request
+                    || matches!(number(state, 1), Some(1 | 2 | 5))
+            }) {
+                pending_quick = None;
+            }
+            if number(state, 1) == Some(3)
+                && let Some(event) = pending_quick.take()
+                && let Some(id) = request
+                && !seen.iter().any(|s| s == id)
+            {
+                seen.push_back(id.to_owned());
+                if seen.len() > 64 {
+                    seen.pop_front();
+                }
+                let _ = sender.try_send(event);
+            }
         }
         if let Some((request, text)) = recognized(&data)
             && !seen.contains(&request)
         {
-            seen.push_back(request);
+            seen.push_back(request.clone());
             if seen.len() > 64 {
                 seen.pop_front();
             }
@@ -363,8 +435,25 @@ async fn read_events(
                     intent,
                     received: Instant::now(),
                     from_voice: true,
+                    quick: false,
+                    request_id: Some(request),
                 });
             }
+        }
+        if !ducking.active()
+            && latest_request.is_some()
+            && let Some(intent) = quick_command(&data)
+        {
+            // The firmware announces the request ID in IDLE, then the spotted
+            // phrase, then BUSY. Wait for that exact request so cancellation and
+            // activation recovery cannot affect a different conversation.
+            pending_quick = Some(Event {
+                intent,
+                received: Instant::now(),
+                from_voice: true,
+                quick: true,
+                request_id: latest_request.clone(),
+            });
         }
         if data.capacity() > 64 * 1024 {
             data = Vec::with_capacity(4096);
@@ -374,6 +463,7 @@ async fn read_events(
 pub async fn watch(
     sender: mpsc::Sender<Event>,
     ducking: Arc<crate::ducking::Ducking>,
+    activation: Arc<crate::voice_recovery::Activation>,
     address: SocketAddr,
 ) {
     let mut seen: VecDeque<String> = VecDeque::new();
@@ -381,10 +471,11 @@ pub async fn watch(
         let result: io::Result<()> = async {
             let mut socket = TcpStream::connect(address).await?;
             eprintln!("voice: connected to native Alice events");
-            read_events(&mut socket, &sender, &ducking, &mut seen).await
+            read_events(&mut socket, &sender, &ducking, &activation, &mut seen).await
         }
         .await;
         ducking.set_busy(false);
+        activation.observe(None, None);
         if sender.is_closed() {
             return;
         }
@@ -426,6 +517,19 @@ mod tests {
                 let mut msg = vec![0; size as usize];
                 socket.read_exact(&mut msg).await.unwrap();
                 assert_eq!(number(&msg, 253), Some(210));
+                let remoting = bytes(&msg, 252).unwrap();
+                if let Some(method) = bytes(remoting, 8) {
+                    assert_eq!(
+                        number(method, 1),
+                        Some(1),
+                        "must cancelDialog, never stopConversation"
+                    );
+                    assert_eq!(number(method, 7), Some(0));
+                    assert_eq!(
+                        bytes(method, 10),
+                        Some(b"01234567-89ab-cdef-0123-456789abcdef".as_slice())
+                    );
+                }
                 objects.push(
                     std::str::from_utf8(bytes(bytes(&msg, 252).unwrap(), 7).unwrap())
                         .unwrap()
@@ -434,13 +538,164 @@ mod tests {
             }
             objects
         });
-        prepare_playback(Some(address), true).await.unwrap();
+        prepare_playback(
+            Some(address),
+            true,
+            Some("01234567-89ab-cdef-0123-456789abcdef"),
+        )
+        .await
+        .unwrap();
         let objects = tokio::time::timeout(Duration::from_secs(2), receiver)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(objects, ["AliceCapability", "PlaybackControlCapability"]);
-        prepare_playback(None, true).await.unwrap();
+        prepare_playback(None, true, None).await.unwrap();
+    }
+    #[tokio::test]
+    async fn activation_recovery_starts_without_enabling_a_disabled_spotter() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let receiver = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let size = socket.read_u32_le().await.unwrap();
+            let mut msg = vec![0; size as usize];
+            socket.read_exact(&mut msg).await.unwrap();
+            let remoting = bytes(&msg, 252).unwrap();
+            assert_eq!(number(&msg, 253), Some(210));
+            assert_eq!(
+                bytes(remoting, 7),
+                Some(b"ActivationSpotterCapability".as_slice())
+            );
+            assert_eq!(bytes(remoting, 14), Some([8, 2].as_slice()));
+        });
+        start_activation(address).await.unwrap();
+        receiver.await.unwrap();
+    }
+    fn spotter_frame(capability: &str, method: u64, kind: u64, phrase: &[u8]) -> Vec<u8> {
+        let mut notification = Vec::new();
+        put_number(&mut notification, 1, kind);
+        put_bytes(&mut notification, 3, phrase);
+        rpc(capability, method, &notification)
+    }
+    #[test]
+    fn quick_commands_accept_only_command_spotter_phrase_notifications() {
+        for (phrase, expected) in [
+            ("стоп", Intent::Pause),
+            ("пауза", Intent::Pause),
+            ("хватит", Intent::Pause),
+            ("дальше", Intent::Next),
+            ("следующий", Intent::Next),
+            ("назад", Intent::Previous),
+            ("продолжи", Intent::Resume),
+            ("играй", Intent::Resume),
+        ] {
+            let frame = spotter_frame("CommandSpotterCapability", 15, 2, phrase.as_bytes());
+            assert_eq!(quick_command(&frame[4..]), Some(expected));
+            for n in 4..frame.len() {
+                assert_eq!(quick_command(&frame[4..n]), None);
+            }
+        }
+        for (capability, method, kind, phrase) in [
+            ("ActivationSpotterCapability", 15, 2, "стоп"),
+            ("PlaybackControlCapability", 13, 1, "стоп"),
+            ("CommandSpotterCapability", 14, 2, "стоп"),
+            ("CommandSpotterCapability", 15, 1, "стоп"),
+            ("CommandSpotterCapability", 15, 2, "алиса"),
+            ("CommandSpotterCapability", 15, 2, "включи свет"),
+            ("CommandSpotterCapability", 15, 2, "включи песню"),
+        ] {
+            let frame = spotter_frame(capability, method, kind, phrase.as_bytes());
+            assert_eq!(quick_command(&frame[4..]), None);
+        }
+        let invalid = spotter_frame("CommandSpotterCapability", 15, 2, &[0xff]);
+        assert_eq!(quick_command(&invalid[4..]), None);
+    }
+    #[tokio::test]
+    async fn missing_request_id_never_cancels_an_unscoped_dialog() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        prepare_playback(Some(address), true, None).await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let size = socket.read_u32_le().await.unwrap();
+        let mut msg = vec![0; size as usize];
+        socket.read_exact(&mut msg).await.unwrap();
+        assert_eq!(
+            bytes(bytes(&msg, 252).unwrap(), 7),
+            Some(b"PlaybackControlCapability".as_slice())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn quick_commands_wait_for_their_own_busy_request_and_ignore_replays() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let id = "12345678-1234-1234-1234-123456789012";
+        let state = |kind, id: &str| {
+            let mut body = Vec::new();
+            put_number(&mut body, 1, kind);
+            put_bytes(&mut body, 7, id.as_bytes());
+            let mut msg = Vec::new();
+            put_bytes(&mut msg, 252, &body);
+            put_number(&mut msg, 253, 3);
+            let mut frame = (msg.len() as u32).to_le_bytes().to_vec();
+            frame.extend(msg);
+            frame
+        };
+        for (begin, end, command, request) in [
+            (0, 3, "дальше", id),
+            (0, 3, "дальше", id), // Duplicate native delivery.
+            (1, 3, "стоп", "22345678-1234-1234-1234-123456789012"), // Existing dialog.
+            (0, 3, "пауза", "32345678-1234-1234-1234-123456789012"),
+            (0, 3, "назад", ""), // Missing request ID.
+        ] {
+            client.write_all(&state(begin, request)).await.unwrap();
+            client
+                .write_all(&spotter_frame(
+                    "CommandSpotterCapability",
+                    15,
+                    2,
+                    command.as_bytes(),
+                ))
+                .await
+                .unwrap();
+            client.write_all(&state(end, request)).await.unwrap();
+        }
+        client.write_all(&state(0, id)).await.unwrap();
+        client
+            .write_all(&spotter_frame(
+                "CommandSpotterCapability",
+                15,
+                2,
+                "назад".as_bytes(),
+            ))
+            .await
+            .unwrap();
+        client
+            .write_all(&state(3, "42345678-1234-1234-1234-123456789012"))
+            .await
+            .unwrap();
+        drop(client);
+        let (sender, mut events) = mpsc::channel(8);
+        let result = read_events(
+            &mut server,
+            &sender,
+            &crate::ducking::Ducking::new(),
+            &crate::voice_recovery::Activation::default(),
+            &mut VecDeque::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        for intent in [Intent::Next, Intent::Pause] {
+            let event = events.try_recv().unwrap();
+            assert_eq!(event.intent, intent);
+            assert!(event.from_voice && event.quick);
+            assert!(event.request_id.is_some());
+        }
+        assert!(events.try_recv().is_err());
     }
     #[test]
     fn native_volume_commands_are_distinct_from_music_and_questions() {
@@ -498,7 +753,14 @@ mod tests {
         let duck = Arc::new(crate::ducking::Ducking::new());
         let observed = duck.clone();
         let reader = tokio::spawn(async move {
-            let result = read_events(&mut server, &sender, &observed, &mut VecDeque::new()).await;
+            let result = read_events(
+                &mut server,
+                &sender,
+                &observed,
+                &crate::voice_recovery::Activation::default(),
+                &mut VecDeque::new(),
+            )
+            .await;
             observed.set_busy(false);
             result
         });

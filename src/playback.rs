@@ -13,6 +13,7 @@ enum Phase {
 }
 pub struct Playback {
     phase: Phase,
+    start_error: bool,
     request: Option<u64>,
     track: Option<SpotifyUri>,
     position: u32,
@@ -22,6 +23,7 @@ impl Default for Playback {
     fn default() -> Self {
         Self {
             phase: Phase::Idle,
+            start_error: false,
             request: None,
             track: None,
             position: 0,
@@ -45,9 +47,17 @@ impl Playback {
     pub fn loading(&self) -> bool {
         self.phase == Phase::Loading
     }
+    pub fn clear_start_error(&mut self) {
+        self.start_error = false;
+    }
+    pub fn fail_start(&mut self) {
+        self.start_error = true;
+    }
     pub fn error(&self) -> &str {
         if self.phase == Phase::Unavailable {
             "Track unavailable; see spotify-connect.log"
+        } else if self.start_error {
+            "Spotify did not start the requested playback; try the command again"
         } else {
             ""
         }
@@ -98,6 +108,7 @@ impl Playback {
                 if !self.matches(*play_request_id, track_id) {
                     return false;
                 }
+                self.start_error = false;
                 self.track = Some(track_id.clone());
                 self.phase = if matches!(event, Playing { .. }) {
                     Phase::Playing

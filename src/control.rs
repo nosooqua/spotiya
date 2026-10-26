@@ -203,6 +203,8 @@ pub async fn serve(
                         intent,
                         received: Instant::now(),
                         from_voice: false,
+                        quick: false,
+                        request_id: None,
                     })
                     .is_ok()
                 {
