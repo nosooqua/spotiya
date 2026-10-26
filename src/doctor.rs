@@ -491,18 +491,9 @@ mod tests {
                 Some("other_warning_or_error"),
             ),
             (
-                "[INFO librespot_audio::playplay] PlayPlay decoder ready",
-                None,
-            ),
-            (
                 "[INFO librespot_playback::audio_backend::alsa] Using AlsaSink with format: S16",
                 None,
             ),
-            (
-                "[INFO librespot_core::playplay] AP audio key refused; trying PlayPlay",
-                None,
-            ),
-            ("receiver: PlayPlay decoder configured on demand", None),
             ("supervisor: receiver started (pid 31719)", None),
         ] {
             assert_eq!(category(line), expected, "{line}");

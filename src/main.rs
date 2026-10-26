@@ -44,7 +44,6 @@ mod ducking;
 mod installation;
 mod logging;
 mod playback;
-mod playplay;
 mod profile_selection;
 mod profiles;
 mod recovery;
@@ -907,11 +906,6 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .ok_or_else(|| io::Error::other("No install directory"))?
         .to_path_buf();
-    let playplay = playplay::resolver(base.clone());
-    info.playplay_available = playplay::available(&base);
-    if info.playplay_available {
-        eprintln!("receiver: PlayPlay fallback available (lazy)");
-    }
     let mut airplay =
         airplay::Runtime::new(&base, &options.state_dir, &options.name, &profile.audio);
     airplay.poll(&shared.airplay).await;
@@ -957,7 +951,6 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             },
             _=tokio::time::sleep_until(retry_at), if spirc.is_none() && connecting.is_none() && credentials.is_some() && !failures.blocked()=>{
                 session=Session::new(config.clone(),Some(cache.clone()));
-                session.audio_key().set_playplay_resolver(Some(playplay.clone()));
                 player.set_session(session.clone());
                 let connect=ConnectConfig { name:options.name.clone(), initial_volume:mixer.volume(),
                     volume_steps:100, device_type:DeviceType::Speaker, ..Default::default() };
@@ -1210,7 +1203,6 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         let playing = playback.playing() || shared.airplay.active.load(Ordering::Acquire);
         audio_guard.set_playing(playing);
-        info.playplay_available = playplay::available(&base);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();
         publish_status(

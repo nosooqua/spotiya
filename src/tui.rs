@@ -839,7 +839,7 @@ impl AddonMenu {
             let label = if installing == Some(addon.id) {
                 "Installing"
             } else {
-                (addon.state)(status).label(addon.command.is_none())
+                (addon.state)(status).label()
             };
             out.push(format!(
                 "{} {}   [{}]",
@@ -856,10 +856,6 @@ impl AddonMenu {
             out.push("Installation in progress. c: cancel download".into());
         } else if self.confirm_remove {
             out.push(format!("Press x again to remove {}", addon.name));
-        } else if state.installed && addon.command.is_none() {
-            out.push(
-                "Ready; used automatically when ordinary Spotify audio keys are refused.".into(),
-            );
         } else if state.installed {
             out.push(format!(
                 "Enter: {} {}",
@@ -1313,22 +1309,8 @@ mod tests {
         for key in b"\x1b[B" {
             assert!(menu.key(*key).is_none());
         }
-        assert_eq!(menu.selected, 1);
-        let frame = menu.lines(&status, 24, None, "");
-        assert!(frame.iter().any(|s| s.contains("Enter: download PlayPlay")));
-        status.playplay_available = true;
-        let frame = menu.lines(&status, 24, None, "");
-        assert!(
-            frame
-                .iter()
-                .any(|s| s.contains("PlayPlay   [Ready (on demand)]"))
-        );
-        assert!(
-            frame
-                .iter()
-                .any(|s| s.contains("Ready; used automatically"))
-        );
-        assert!(!frame.iter().any(|s| s.contains("Enter: disable PlayPlay")));
+        assert_eq!(menu.selected, 0);
+        assert_eq!(crate::addons::CATALOG.len(), 1);
         assert!(matches!(menu.key(b'c'), Some(AddonAction::StopInstall)));
         assert!(matches!(menu.key(b'q'), Some(AddonAction::Cancel)));
     }
