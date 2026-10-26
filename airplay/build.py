@@ -53,7 +53,7 @@ def auto(name, opts=(), env=None):
 
 def build(name):
     stamp = ROOT/'logs'/f'{name}.done'
-    signature=hashlib.sha256(b''.join((RECIPE/name).read_bytes() for name in ['build.py','fetch.py','sources.json','avahi-no-reverse.patch']) + str(TOOL).encode() + subprocess.check_output([CROSS+'gcc','--version'])).hexdigest()
+    signature=hashlib.sha256(b''.join((RECIPE/name).read_bytes() for name in ['build.py','fetch.py','sources.json','avahi-no-reverse.patch','avahi-runtime-user.patch']) + str(TOOL).encode() + subprocess.check_output([CROSS+'gcc','--version'])).hexdigest()
     if stamp.exists() and stamp.read_text().strip()==signature:
         print(f'CACHED {name}', flush=True); return
     print(f'START {name}', flush=True)
@@ -87,11 +87,12 @@ def build(name):
         auto(name, ['--disable-tests', '--disable-xml-docs', '--disable-doxygen-docs', '--disable-ducktype-docs', '--disable-selinux', '--disable-apparmor', '--disable-libaudit', '--disable-systemd', '--disable-x11-autolaunch', '--without-x', '--disable-verbose-mode', '--disable-asserts', '--disable-stats', '--disable-Werror', '--with-system-socket=/run/dbus/system_bus_socket', '--with-system-pid-file=/run/dbus/pid', '--sysconfdir=/etc', '--localstatedir=/var'])
     elif name == 'avahi':
         # Apply the shipped patch itself, so the package documents exactly what was built.
-        patch = str(RECIPE/'avahi-no-reverse.patch')
-        # --force: never guess the direction; --batch would silently treat a reverse check as forward.
-        applied = subprocess.run(['patch', '-p1', '--reverse', '--force', '--dry-run', '--silent', '-i', patch], cwd=ROOT/name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        if not applied:
-            run(name, ['patch', '-p1', '--forward', '--force', '-i', patch])
+        for filename in ['avahi-no-reverse.patch', 'avahi-runtime-user.patch']:
+            patch = str(RECIPE/filename)
+            # --force: never guess the direction; --batch can reverse the wrong patch.
+            applied = subprocess.run(['patch', '-p1', '--reverse', '--force', '--dry-run', '--silent', '-i', patch], cwd=ROOT/name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            if not applied:
+                run(name, ['patch', '-p1', '--forward', '--force', '-i', patch])
         auto(name, ['--with-distro=none', '--disable-nls', '--disable-glib', '--disable-gobject', '--disable-introspection', '--disable-libevent', '--disable-qt3', '--disable-qt4', '--disable-qt5', '--disable-gtk', '--disable-gtk3', '--disable-gdbm', '--disable-python', '--disable-pygobject', '--disable-python-dbus', '--disable-mono', '--disable-monodoc', '--disable-autoipd', '--disable-doxygen-doc', '--disable-manpages', '--disable-xmltoman', '--disable-stack-protector', '--disable-ssp', '--with-xml=expat', '--with-dbus-sys=/etc/dbus-1/system.d', '--sysconfdir=/etc', '--localstatedir=/var', '--with-avahi-user=nobody', '--with-avahi-group=nogroup', '--with-systemdsystemunitdir=/nonexistent'])
     elif name == 'nqptp':
         run(name, ['autoreconf', '-fi'])

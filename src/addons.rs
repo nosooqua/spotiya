@@ -109,6 +109,7 @@ fn allowed(addon: &Addon, path: &Path) -> bool {
             | "sources.json"
             | "revisions.json"
             | "avahi-no-reverse.patch"
+            | "avahi-runtime-user.patch"
     ) || addon.bins.iter().any(|b| p == format!("bin/{b}"))
         || (p.starts_with("licenses/") && path.components().count() == 4)
 }
@@ -571,9 +572,17 @@ mod tests {
     fn installs_only_addon_payload_and_does_not_restart_or_replace_spotify() {
         let dir = fixture();
         let addon = &CATALOG[0];
-        let (path, sums) = archive(&dir.0, false, None);
+        let (path, sums) = archive(
+            &dir.0,
+            false,
+            Some((
+                "spotiya-airplay2/airplay/avahi-runtime-user.patch",
+                tar::EntryType::Regular,
+            )),
+        );
         install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).unwrap();
         assert!(airplay_available(&dir.0));
+        assert!(dir.0.join("airplay/avahi-runtime-user.patch").is_file());
         assert!(!dir.0.join("receiver-state/airplay-enabled").exists());
         unchanged(&dir.0);
         assert_eq!(

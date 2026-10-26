@@ -1,0 +1,57 @@
+--- a/avahi-daemon/main.c
++++ b/avahi-daemon/main.c
+@@ -1409,18 +1409,27 @@
+     int r = -1;
+     mode_t u;
+     int reset_umask = 0;
+-    struct passwd *pw;
+-    struct group * gr;
++    uid_t uid = geteuid();
++    gid_t gid = getegid();
+     struct stat st;
+ 
+-    if (!(pw = getpwnam(AVAHI_USER))) {
+-        avahi_log_error( "Failed to find user '"AVAHI_USER"'.");
+-        goto fail;
+-    }
+-
+-    if (!(gr = getgrnam(AVAHI_GROUP))) {
+-        avahi_log_error( "Failed to find group '"AVAHI_GROUP"'.");
+-        goto fail;
++    /* A private daemon started with --no-drop-root does not use AVAHI_USER
++     * or AVAHI_GROUP. Embedded systems need not provide those accounts. */
++    if (config.drop_root) {
++        struct passwd *pw;
++        struct group *gr;
++
++        if (!(pw = getpwnam(AVAHI_USER))) {
++            avahi_log_error( "Failed to find user '"AVAHI_USER"'.");
++            goto fail;
++        }
++
++        if (!(gr = getgrnam(AVAHI_GROUP))) {
++            avahi_log_error( "Failed to find group '"AVAHI_GROUP"'.");
++            goto fail;
++        }
++        uid = pw->pw_uid;
++        gid = gr->gr_gid;
+     }
+ 
+     u = umask(0000);
+@@ -1431,14 +1440,14 @@
+         goto fail;
+     }
+ 
+-    chown(AVAHI_DAEMON_RUNTIME_DIR, pw->pw_uid, gr->gr_gid);
++    chown(AVAHI_DAEMON_RUNTIME_DIR, uid, gid);
+ 
+     if (stat(AVAHI_DAEMON_RUNTIME_DIR, &st) < 0) {
+         avahi_log_error("stat(): %s\n", strerror(errno));
+         goto fail;
+     }
+ 
+-    if (!S_ISDIR(st.st_mode) || st.st_uid != pw->pw_uid || st.st_gid != gr->gr_gid) {
++    if (!S_ISDIR(st.st_mode) || st.st_uid != uid || st.st_gid != gid) {
+         avahi_log_error("Failed to create runtime directory "AVAHI_DAEMON_RUNTIME_DIR".");
+         goto fail;
+     }

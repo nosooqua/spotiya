@@ -42,7 +42,8 @@ with tempfile.TemporaryDirectory(prefix="airplay-package-",dir=DIST) as scratch:
     (payload/"manifest.json").write_text(json.dumps({"format": 1, "target": "armv7-unknown-linux-gnueabihf", "spotiya_version": version, "files": hashes}, indent=2)+"\n")
     (payload/"SHA256SUMS").write_text("\n".join(sums)+"\n")
     shutil.copy2(RECIPE/"sources.json",payload/"sources.json")
-    shutil.copy2(RECIPE/"avahi-no-reverse.patch",payload/"avahi-no-reverse.patch")
+    for patch in ["avahi-no-reverse.patch", "avahi-runtime-user.patch"]:
+        shutil.copy2(RECIPE/patch,payload/patch)
     import fetch
     revisions = dict(fetch.PROJECTS)
     revisions["spotiya_identity"] = {"model": "AudioAccessory5,1", "purpose": "HomePod mini icon; existing AirPlay capabilities retained"}
