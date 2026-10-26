@@ -10,6 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MaintenanceCLI(unittest.TestCase):
+    def test_station_name_command_preserves_arguments_without_starting_receiver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            receiver = directory / "spotiya"
+            receiver.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+            receiver.chmod(0o700)
+            cli = directory / "cli.sh"
+            cli.write_text((ROOT / "packaging/cli.sh").read_text().replace(
+                "SPOTIYA_BASE=/data/opt/spotify-connect", "SPOTIYA_BASE=" + shlex.quote(str(directory))))
+            for args in [[], ["Гостиная"], ["airplay", 'Гостиная; $(false) "Hi"'], ["reset", "spotify"]]:
+                result = subprocess.run(["sh", str(cli), "name"] + args, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), ["--device-name"] + args)
+
     def test_maintenance_never_starts_receiver_and_keeps_paths_as_single_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -20,6 +34,12 @@ class MaintenanceCLI(unittest.TestCase):
             env = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ["PATH"], SPOTIYA_TEST_LOG=str(log))
             path = "/tmp/report with spaces; $(false).json"
             cases = [
+                (["name"], ["--device-name"]),
+                (["name", "Гостиная"], ["--device-name", "Гостиная"]),
+                (["name", "airplay", 'Гостиная; $(false) "Hi"'], ["--device-name", "airplay", 'Гостиная; $(false) "Hi"']),
+                (["name", "spotify", "Кухня"], ["--device-name", "spotify", "Кухня"]),
+                (["name", "reset"], ["--device-name", "reset"]),
+                (["name", "reset", "airplay"], ["--device-name", "reset", "airplay"]),
                 (["addon", "install", "airplay"], ["--addon-install", "airplay"]),
                 (["addon", "remove", "airplay"], ["--addon-remove", "airplay"]),
                 (["addon", "file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"], ["--addon-install-file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"]),

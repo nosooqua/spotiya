@@ -2,6 +2,10 @@
 set -eu
 SPOTIYA_BASE=/data/opt/spotify-connect
 case "${1:-tui}" in
+    name)
+        shift
+        set -- --device-name "$@"
+        ;;
     addon)
         shift
         if [ "$#" -eq 2 ] && [ "$1" = install ]; then

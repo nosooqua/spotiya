@@ -257,7 +257,7 @@ impl Mixer for DeviceMixer {
 
 struct Options {
     state_dir: PathBuf,
-    name: String,
+    name: Option<String>,
     buttons: bool,
     voice: bool,
     supervise: bool,
@@ -266,13 +266,14 @@ struct Options {
 fn options() -> Result<Option<Options>, String> {
     let mut result = Options {
         state_dir: "/data/opt/spotify-connect/receiver-state".into(),
-        name: device::system_name(),
+        name: None,
         buttons: true,
         voice: true,
         supervise: false,
         profile: None,
     };
     let mut args = std::env::args().skip(1);
+    let mut name_action = None;
     let mut profile_info = false;
     let mut profile_list = false;
     let mut profile_select = None;
@@ -305,7 +306,17 @@ fn options() -> Result<Option<Options>, String> {
             "--state-dir" => {
                 result.state_dir = args.next().ok_or("missing state directory")?.into()
             }
-            "--name" => result.name = args.next().ok_or("missing device name")?,
+            "--name" => {
+                result.name = Some(
+                    device::validate(&args.next().ok_or("missing device name")?)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+            "--device-name" => {
+                name_action = Some(
+                    device::parse(&args.by_ref().collect::<Vec<_>>()).map_err(|e| e.to_string())?,
+                );
+            }
             "--profile" => {
                 result.profile = Some(args.next().ok_or("missing profile id or JSON path")?)
             }
@@ -417,7 +428,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --device-name [NAME | spotify NAME | airplay NAME | reset [spotify|airplay]]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
                 );
                 return Ok(None);
             }
@@ -433,6 +444,7 @@ fn options() -> Result<Option<Options>, String> {
         profile_select.is_some(),
         profile_list,
         profile_info,
+        name_action.is_some(),
     ]
     .into_iter()
     .filter(|v| *v)
@@ -440,6 +452,16 @@ fn options() -> Result<Option<Options>, String> {
         > 1
     {
         return Err("Choose one maintenance operation per command".into());
+    }
+    if let Some(action) = name_action {
+        device::execute(
+            &result.state_dir,
+            result.profile.as_deref(),
+            result.name.as_deref(),
+            action,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(None);
     }
     if doctor {
         doctor::run(&result.state_dir, doctor_report.as_deref()).map_err(|e| e.to_string())?;
@@ -705,7 +727,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 }
 async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     if options.supervise {
-        let _ = resolved_profile(&options)?;
+        let profile = resolved_profile(&options)?;
+        device::read(&options.state_dir)?
+            .resolve(&profile.profile.name, options.name.as_deref())?;
         supervisor::run(&options).await?;
         return Ok(());
     }
@@ -714,6 +738,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let resolved = resolved_profile(&options)?;
     let profile = resolved.profile;
     let caps = resolved.capabilities;
+    let names =
+        device::read(&options.state_dir)?.resolve(&profile.name, options.name.as_deref())?;
     let native = profile.voice.as_ref().map(|v| v.address);
     let voice_setting = options.state_dir.join("voice-enabled");
     let mut voice_enabled = options.voice
@@ -746,7 +772,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         config.device_id.clone(),
         config.client_id.clone(),
     )
-    .name(options.name.clone())
+    .name(names.spotify.clone())
     .device_type(DeviceType::Speaker)
     .port(10337)
     .launch()?;
@@ -884,7 +910,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_status = Vec::new();
     let mut status_buffer = Vec::new();
     let mut info = control::Status {
-        name: options.name.clone(),
+        name: names.spotify.clone(),
+        airplay_name: names.airplay.clone(),
         voice: voice_enabled,
         voice_supported: caps.voice,
         profile: profile.id.clone(),
@@ -907,7 +934,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| io::Error::other("No install directory"))?
         .to_path_buf();
     let mut airplay =
-        airplay::Runtime::new(&base, &options.state_dir, &options.name, &profile.audio);
+        airplay::Runtime::new(&base, &options.state_dir, &names.airplay, &profile.audio);
     airplay.poll(&shared.airplay).await;
     airplay.status(&mut info, &shared.airplay);
     let mut playback = playback::Playback::default();
@@ -952,7 +979,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             _=tokio::time::sleep_until(retry_at), if spirc.is_none() && connecting.is_none() && credentials.is_some() && !failures.blocked()=>{
                 session=Session::new(config.clone(),Some(cache.clone()));
                 player.set_session(session.clone());
-                let connect=ConnectConfig { name:options.name.clone(), initial_volume:mixer.volume(),
+                let connect=ConnectConfig { name:names.spotify.clone(), initial_volume:mixer.volume(),
                     volume_steps:100, device_type:DeviceType::Speaker, ..Default::default() };
                 let attempt=Spirc::new(connect,session.clone(),credentials.clone().unwrap(),player.clone(),mixer.clone());
                 connecting=Some(Box::pin(async move {

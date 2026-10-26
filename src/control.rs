@@ -52,6 +52,7 @@ pub struct Status {
     pub duration_ms: u32,
     pub position_ms: u32,
     pub name: String,
+    pub airplay_name: String,
 }
 pub fn parse(line: &str) -> Option<Intent> {
     match line.trim() {

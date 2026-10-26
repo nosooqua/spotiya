@@ -170,9 +170,11 @@ pub async fn run(options: &Options) -> io::Result<()> {
     let mut args = vec![
         OsString::from("--state-dir"),
         options.state_dir.clone().into_os_string(),
-        OsString::from("--name"),
-        OsString::from(&options.name),
     ];
+    if let Some(name) = &options.name {
+        args.push("--name".into());
+        args.push(name.into());
+    }
     if let Some(profile) = &options.profile {
         args.push("--profile".into());
         args.push(profile.into());

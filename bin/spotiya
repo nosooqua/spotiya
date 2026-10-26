@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
     parser.add_argument("command", nargs="?", default="tui", choices=(
         "tui", "addons", "addon", "airplay", "login", "status", "play", "pause", "resume", "toggle", "next",
-        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles", "doctor", "update"))
+        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "name", "profile", "profiles", "doctor", "update"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
     if args.command == "play":
@@ -55,6 +55,8 @@ def main():
     elif args.command in ("volume", "voice", "spectrum", "airplay"):
         if len(args.value) != 1:
             parser.error(args.command + " needs one value")
+        value = args.value
+    elif args.command == "name":
         value = args.value
     elif args.command == "addon":
         if len(args.value) == 2 and args.value[0] in ("install", "remove"):
@@ -98,12 +100,14 @@ def main():
     interactive = args.command in ("tui", "addons")
     if interactive and not sys.stdin.isatty():
         parser.error(args.command + " needs an interactive terminal")
-    if args.command not in ("status", "version", "profile", "profiles", "doctor", "update", "addon"):
+    if args.command not in ("status", "version", "name", "profile", "profiles", "doctor", "update", "addon"):
         start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
             sys.exit(start.stdout.strip() or "Unable to start receiver")
     remote_command = ("profile-select" if value else "profile-info") if args.command == "profile" else args.command
-    if args.command == "doctor" and value:
+    if args.command == "name":
+        remote_command = "device-name"
+    elif args.command == "doctor" and value:
         remote_command = "doctor-report"
     elif args.command == "update":
         remote_command = "update-file" if len(value) == 2 else ("update-tag" if value else ("update-check" if args.value else "update"))
