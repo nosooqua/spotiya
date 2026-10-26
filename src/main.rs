@@ -798,7 +798,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(true);
     let spectrum_setting = options.state_dir.join("spectrum-enabled");
     let led_model = profile.leds.filter(|_| caps.leds);
-    let spectrum_supported = caps.display || led_model.is_some();
+    let spectrum_supported = caps.spectrum();
     let spectrum_enabled = spectrum_supported
         && fs::read_to_string(&spectrum_setting)
             .map(|s| s.trim() == "1")

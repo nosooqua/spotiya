@@ -131,6 +131,9 @@ impl Capabilities {
     pub fn controls(self) -> bool {
         self.buttons || self.ring || self.display || self.leds
     }
+    pub fn spectrum(self) -> bool {
+        self.display || self.leds
+    }
 }
 #[derive(Serialize)]
 pub struct Resolved {
@@ -740,6 +743,28 @@ mod tests {
             let r = f.load("auto").unwrap();
             assert_eq!(r.profile.id, "generic", "{device}");
             assert!(!r.capabilities.voice);
+        }
+    }
+    #[test]
+    fn station2_and_midi_support_spectrum_without_a_clock_display() {
+        for (profile, name, size, bits, stride) in [
+            ("midi", "YNDX LED screen", "89,1", "32", "356"),
+            ("cucumber", "ring", "24,1", "24", "72"),
+        ] {
+            let f = Fixture::new();
+            assert!(!f.load(profile).unwrap().capabilities.spectrum());
+            f.file("/dev/fb0", b"");
+            for (attribute, value) in [
+                ("name", name),
+                ("virtual_size", size),
+                ("bits_per_pixel", bits),
+                ("stride", stride),
+            ] {
+                f.file(&format!("/sys/class/graphics/fb0/{attribute}"), value);
+            }
+            let caps = f.load(profile).unwrap().capabilities;
+            assert!(!caps.display);
+            assert!(caps.spectrum());
         }
     }
     #[test]

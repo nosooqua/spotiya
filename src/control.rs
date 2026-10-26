@@ -196,7 +196,7 @@ pub async fn serve(
                     "ERROR Voice control is unavailable in this device profile\n".into()
                 } else if matches!(intent, Intent::Controls(_)) && !capabilities.controls() {
                     "ERROR Physical controls are unavailable in this device profile\n".into()
-                } else if matches!(intent, Intent::Spectrum(_)) && !capabilities.display {
+                } else if matches!(intent, Intent::Spectrum(_)) && !capabilities.spectrum() {
                     "ERROR Spectrum display is unavailable on this device\n".into()
                 } else if sender
                     .try_send(Event {

@@ -451,8 +451,8 @@ pub fn start(model: Model, shared: Arc<crate::Shared>) -> thread::JoinHandle<()>
             {
                 effect = Some(event);
             }
-            let allowed = shared.controls_enabled.load(Ordering::Acquire);
-            if allowed && native.is_none() && now >= native_retry {
+            let controls_enabled = shared.controls_enabled.load(Ordering::Acquire);
+            if controls_enabled && native.is_none() && now >= native_retry {
                 match Foreground::open(model, false) {
                     Ok(foreground) => native = Some(foreground),
                     Err(e) => eprintln!("leds: native compositor assets unavailable: {e}"),
@@ -461,7 +461,7 @@ pub fn start(model: Model, shared: Arc<crate::Shared>) -> thread::JoinHandle<()>
             }
             // Unlike background spectrum, short user feedback is allowed during Alice.
             // Release our last frame BEFORE asking the native compositor to take over.
-            if let Some(effect) = effect.filter(|_| allowed) {
+            if let Some(effect) = effect.filter(|_| controls_enabled) {
                 output = None;
                 if let Some(native) = &native {
                     match native.show(effect, decreasing) {
@@ -470,11 +470,8 @@ pub fn start(model: Model, shared: Arc<crate::Shared>) -> thread::JoinHandle<()>
                     }
                 }
             }
-            let frame = if allowed
-                && !shared.ducking.active()
-                && now >= foreground_until
-                && active
-                && !paused
+            // Music visualization is controlled by Spectrum, independently of controls.
+            let frame = if !shared.ducking.active() && now >= foreground_until && active && !paused
             {
                 shared.spectrum.frame().map(|levels| {
                     visual(model, levels, (origin.elapsed().as_millis() / 30) as usize)
