@@ -53,7 +53,7 @@ def auto(name, opts=(), env=None):
 
 def build(name):
     stamp = ROOT/'logs'/f'{name}.done'
-    signature=hashlib.sha256(b''.join((RECIPE/name).read_bytes() for name in ['build.py','fetch.py','sources.json','avahi-no-reverse.patch','avahi-runtime-user.patch']) + str(TOOL).encode() + subprocess.check_output([CROSS+'gcc','--version'])).hexdigest()
+    signature=hashlib.sha256(b''.join((RECIPE/name).read_bytes() for name in ['build.py','fetch.py','sources.json','avahi-no-reverse.patch','avahi-runtime-user.patch','shairport-control.patch','spotiya-control.c','spotiya-control.h']) + str(TOOL).encode() + subprocess.check_output([CROSS+'gcc','--version'])).hexdigest()
     if stamp.exists() and stamp.read_text().strip()==signature:
         print(f'CACHED {name}', flush=True); return
     print(f'START {name}', flush=True)
@@ -99,6 +99,12 @@ def build(name):
         run(name, ['./configure', '--host=arm-linux-gnueabihf', '--build=x86_64-pc-linux-gnu', f'--prefix={PREFIX}', '--sysconfdir=/etc', '--without-systemd-startup'])
         run(name, ['make', '-j3'])
     elif name == 'shairport-sync':
+        patch = str(RECIPE/'shairport-control.patch')
+        applied = subprocess.run(['patch', '-p1', '--reverse', '--force', '--dry-run', '--silent', '-i', patch], cwd=ROOT/name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if not applied:
+            run(name, ['patch', '-p1', '--forward', '--force', '-i', patch])
+        for filename in ['spotiya-control.c', 'spotiya-control.h']:
+            shutil.copy2(RECIPE/filename, ROOT/name/filename)
         source = ROOT/'shairport-sync/shairport.c'
         text = source.read_text()
         old = 'config.model = strdup("ShairportSync");'
@@ -115,7 +121,7 @@ def build(name):
         ENV['CPPFLAGS'] += ''.join(' -Dsnd_pcm_hw_params_'+n+'=__snd_pcm_hw_params_'+n for n in modern_alsa)
         ENV['LDFLAGS'] += ' -Wl,--disable-new-dtags,-rpath,/system/vendor/quasar/libs'
         run(name, ['autoreconf', '-fi'])
-        run(name, ['./configure', '--host=arm-linux-gnueabihf', '--build=x86_64-pc-linux-gnu', f'--prefix={PREFIX}', '--sysconfdir=/etc', '--with-airplay-2', '--with-alsa', '--with-avahi', '--with-ssl=openssl', '--without-soxr', '--without-metadata', '--without-dbus-interface', '--without-mpris-interface', '--without-mqtt-client', '--without-systemd-startup', '--without-libdaemon'], {'LIBS': '-lavahi-common -ldbus-1 -lexpat -lpthread -ldl -lm'})
+        run(name, ['./configure', '--host=arm-linux-gnueabihf', '--build=x86_64-pc-linux-gnu', f'--prefix={PREFIX}', '--sysconfdir=/etc', '--with-airplay-2', '--with-alsa', '--with-avahi', '--with-ssl=openssl', '--without-soxr', '--without-metadata', '--without-dbus-interface', '--with-spotiya-control', '--without-mpris-interface', '--without-mqtt-client', '--without-systemd-startup', '--without-libdaemon'], {'LIBS': '-lavahi-common -ldbus-1 -lexpat -lpthread -ldl -lm'})
         run(name, ['make', 'clean'])
         run(name, ['make', '-j4'])
     else:

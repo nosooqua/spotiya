@@ -1,0 +1,63 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -393,7 +393,13 @@
+   AC_MSG_WARN([MQTT needs Avahi for remote control functionality. With the current configuration settings, only metadata publishing will be supported.])
+ fi
+
+-if test "x$with_mpris_interface" = "xyes" || test "x$with_dbus_interface" = "xyes" || test "x$with_mqtt_client" = "xyes" ; then
++AC_ARG_WITH(spotiya-control, [AS_HELP_STRING([--with-spotiya-control],[include Spotiya private control socket])])
++if test "x$with_spotiya_control" = "xyes" ; then
++  AC_DEFINE([CONFIG_SPOTIYA_CONTROL], 1, [Spotiya private control socket])
++fi
++AM_CONDITIONAL([USE_SPOTIYA_CONTROL], [test "x$with_spotiya_control" = "xyes"])
++
++if test "x$with_mpris_interface" = "xyes" || test "x$with_dbus_interface" = "xyes" || test "x$with_mqtt_client" = "xyes" || test "x$with_spotiya_control" = "xyes" ; then
+   REQUESTED_EXTENDED_METADATA_AND_REMOTE_CONTROL_SUPPORT=1
+   REQUESTED_METADATA_HUB_FOR_EXTENDED_METADATA_AND_REMOTE_CONTROL_SUPPORT=1
+   AC_DEFINE([CONFIG_DACP_CLIENT], 1, [DACP client needed for extended metadata support.])
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -45,6 +45,10 @@
+   utilities/general_utilities.c \
+   utilities/exit.c
+
++if USE_SPOTIYA_CONTROL
++shairport_sync_SOURCES += spotiya-control.c
++endif
++
+ if USE_REMOTE_CONTROL
+ shairport_sync_SOURCES +=   remote/remote.c
+ endif
+--- a/shairport.c
++++ b/shairport.c
+@@ -81,6 +81,9 @@
+ #endif
+
+ #include "activity_monitor.h"
++#ifdef CONFIG_SPOTIYA_CONTROL
++#include "spotiya-control.h"
++#endif
+ #include "audio.h"
+ #include "common.h"
+ #include "rtp.h"
+@@ -2255,6 +2258,10 @@
+             }
+     #endif
+     */
++
++#ifdef CONFIG_SPOTIYA_CONTROL
++    spotiya_control_stop();
++#endif
+
+     debug(2, "Stopping the activity monitor.");
+     activity_monitor_stop();
+@@ -3726,6 +3733,9 @@
+   convolver_pool_init(config.convolution_threads, 8); // 8 channels
+ #endif
+   activity_monitor_start();
++#ifdef CONFIG_SPOTIYA_CONTROL
++  spotiya_control_start();
++#endif
+   debug(4, "create an RTSP listener");
+   // note: the Avahi Threaded Poll thread will be named after whatever name you use here too, so
+   // you'll see two threads named "listener" or whatever...

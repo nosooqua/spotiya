@@ -1,17 +1,46 @@
 use std::{
-    sync::atomic::{AtomicU32, Ordering},
+    fs::OpenOptions,
+    io,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 use tokio::time::Instant;
 
 const HOLD: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const LEVEL: f64 = 0.2;
-const ATTACK_FRAMES: f64 = librespot::playback::SAMPLE_RATE as f64 * 0.08;
-const RELEASE_FRAMES: f64 = librespot::playback::SAMPLE_RATE as f64 * 0.3;
+
+// A single aligned atomic word shared with the process-local AirPlay PCM filter.
+// The absolute monotonic deadline also restores gain if the receiver stops updating it.
+struct SharedDeadline(*mut AtomicU32);
+unsafe impl Send for SharedDeadline {}
+impl Drop for SharedDeadline {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.0.cast(), 4);
+        }
+    }
+}
+fn monotonic_ms() -> u32 {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    unsafe {
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) != 0 {
+            return 0;
+        }
+        let time = time.assume_init();
+        (time.tv_sec as u64 * 1000 + time.tv_nsec as u64 / 1_000_000) as u32
+    }
+}
 
 pub struct Ducking {
     origin: Instant,
     until: AtomicU32,
+    airplay: Mutex<Option<SharedDeadline>>,
     pub volume: crate::volume_guard::VolumeGuard,
 }
 impl Ducking {
@@ -19,6 +48,7 @@ impl Ducking {
         Self {
             origin: Instant::now(),
             until: AtomicU32::new(0),
+            airplay: Mutex::new(None),
             volume: crate::volume_guard::VolumeGuard::new(),
         }
     }
@@ -31,7 +61,59 @@ impl Ducking {
             0
         };
         self.until.store(until, Ordering::Release);
+        if let Ok(mapping) = self.airplay.lock()
+            && let Some(mapping) = &*mapping
+        {
+            let deadline = if busy {
+                monotonic_ms().wrapping_add(HOLD.as_millis() as u32).max(1)
+            } else {
+                0
+            };
+            unsafe { &*mapping.0 }.store(deadline, Ordering::Release);
+        }
         self.volume.activity(busy);
+    }
+    pub fn attach_airplay(&self, path: &Path) -> io::Result<()> {
+        let mut slot = self
+            .airplay
+            .lock()
+            .map_err(|_| io::Error::other("AirPlay ducking lock"))?;
+        let temporary = path.with_extension("new");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.set_len(4)?;
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let mapping = SharedDeadline(address.cast());
+        let deadline = if self.active() {
+            let remaining = self
+                .until
+                .load(Ordering::Acquire)
+                .wrapping_sub(self.origin.elapsed().as_millis() as u32);
+            monotonic_ms().wrapping_add(remaining).max(1)
+        } else {
+            0
+        };
+        unsafe { &*mapping.0 }.store(deadline, Ordering::Release);
+        std::fs::rename(temporary, path)?;
+        *slot = Some(mapping);
+        Ok(())
     }
     pub fn active(&self) -> bool {
         let until = self.until.load(Ordering::Acquire);
@@ -40,30 +122,22 @@ impl Ducking {
 }
 
 pub struct Gain(f64);
+unsafe extern "C" {
+    fn spotiya_duck_f64(gain: *mut f64, samples: *mut f64, frames: usize, rate: u32, busy: i32);
+}
 impl Gain {
     pub fn new() -> Self {
         Self(1.0)
     }
     pub fn apply(&mut self, samples: &mut [f64], busy: bool) {
-        let target = if busy { LEVEL } else { 1.0 };
-        if self.0 == 1.0 && target == 1.0 {
-            return;
-        }
-        let step = (1.0 - LEVEL)
-            / if target < self.0 {
-                ATTACK_FRAMES
-            } else {
-                RELEASE_FRAMES
-            };
-        for frame in samples.chunks_exact_mut(usize::from(librespot::playback::NUM_CHANNELS)) {
-            self.0 = if target < self.0 {
-                (self.0 - step).max(target)
-            } else {
-                (self.0 + step).min(target)
-            };
-            for sample in frame {
-                *sample *= self.0;
-            }
+        unsafe {
+            spotiya_duck_f64(
+                &mut self.0,
+                samples.as_mut_ptr(),
+                samples.len() / 2,
+                librespot::playback::SAMPLE_RATE,
+                busy.into(),
+            );
         }
     }
 }
@@ -71,6 +145,24 @@ impl Gain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn airplay_mapping_tracks_activity_and_restarts_during_a_dialog() {
+        let directory = std::env::temp_dir().join(format!("spotiya-duck-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("ducking");
+        let duck = Ducking::new();
+        let deadline = || u32::from_ne_bytes(std::fs::read(&path).unwrap().try_into().unwrap());
+        duck.attach_airplay(&path).unwrap();
+        assert_eq!(deadline(), 0);
+        duck.set_busy(true);
+        assert!((59000..=60000).contains(&deadline().wrapping_sub(monotonic_ms())));
+        duck.attach_airplay(&path).unwrap();
+        assert!((59000..=60000).contains(&deadline().wrapping_sub(monotonic_ms())));
+        duck.set_busy(false);
+        assert_eq!(deadline(), 0);
+        drop(duck);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[tokio::test(start_paused = true)]
     async fn idle_disconnect_and_missing_idle_event_restore_volume() {
         let duck = Ducking::new();

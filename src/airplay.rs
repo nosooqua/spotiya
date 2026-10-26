@@ -6,12 +6,14 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
 use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    net::UnixStream,
     process::{Child, Command},
     sync::{Notify, oneshot},
     time::Instant,
@@ -19,6 +21,9 @@ use tokio::{
 
 pub struct Gate {
     pub active: AtomicBool,
+    pub paused: AtomicBool,
+    pub remote_session: AtomicU32,
+    pub remote_available: AtomicBool,
     pub spotify_open: AtomicBool,
     spotify_closed: Notify,
     pid: Mutex<u32>,
@@ -28,6 +33,9 @@ impl Gate {
     pub fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            remote_session: AtomicU32::new(0),
+            remote_available: AtomicBool::new(false),
             spotify_open: AtomicBool::new(false),
             spotify_closed: Notify::new(),
             pid: Mutex::new(0),
@@ -191,6 +199,7 @@ pub struct Runtime {
     setting: PathBuf,
     name: String,
     audio: profiles::Audio,
+    ducking: Arc<crate::ducking::Ducking>,
     children: Vec<Child>,
     token: String,
     retry_at: Instant,
@@ -200,7 +209,17 @@ pub struct Runtime {
     pub error: String,
 }
 impl Runtime {
-    pub fn new(base: &Path, state: &Path, name: &str, audio: &profiles::Audio) -> Self {
+    #[cfg(test)]
+    pub(crate) fn test_runtime(&mut self, path: &Path) {
+        self.runtime = path.into();
+    }
+    pub fn new(
+        base: &Path,
+        state: &Path,
+        name: &str,
+        audio: &profiles::Audio,
+        ducking: Arc<crate::ducking::Ducking>,
+    ) -> Self {
         let assets = base.join("airplay/bin");
         let available = crate::addons::airplay_available(base);
         let setting = state.join("airplay-enabled");
@@ -211,6 +230,7 @@ impl Runtime {
             setting,
             name: name.into(),
             audio: audio.clone(),
+            ducking,
             children: vec![],
             token: String::new(),
             retry_at: Instant::now(),
@@ -257,7 +277,9 @@ impl Runtime {
             .process_group(0);
         if program == "shairport-sync" {
             cmd.env("LD_PRELOAD", self.runtime.join("visual.so"))
-                .env("SPOTIYA_SPECTRUM_SOCKET", crate::spectrum::AIRPLAY_SOCKET);
+                .env("SPOTIYA_SPECTRUM_SOCKET", crate::spectrum::AIRPLAY_SOCKET)
+                .env("SPOTIYA_AIRPLAY_CONTROL", self.runtime.join("control"))
+                .env("SPOTIYA_DUCKING_STATE", self.runtime.join("ducking"));
         }
         unsafe {
             cmd.pre_exec(|| {
@@ -279,6 +301,8 @@ impl Runtime {
     }
     async fn start(&mut self, gate: &Gate) -> io::Result<()> {
         fs::create_dir_all(&self.runtime)?;
+        let _ = fs::remove_file(self.runtime.join("control"));
+        self.ducking.attach_airplay(&self.runtime.join("ducking"))?;
         fs::write(
             self.runtime.join("visual.so.new"),
             include_bytes!(concat!(env!("OUT_DIR"), "/airplay-tap.so")),
@@ -363,6 +387,9 @@ impl Runtime {
     }
     pub async fn stop(&mut self, gate: &Gate) {
         self.token.clear();
+        gate.remote_available.store(false, Ordering::Release);
+        gate.remote_session.store(0, Ordering::Release);
+        gate.paused.store(false, Ordering::Release);
 
         for child in self.children.iter_mut().rev() {
             if let Some(pid) = child.id() {
@@ -444,14 +471,105 @@ impl Runtime {
                 log::warn!("airplay: {}", self.error);
             }
         }
+        if self.running() && self.runtime.join("control").exists() {
+            match self
+                .remote("STATUS\n")
+                .await
+                .and_then(|reply| parse_remote_state(&reply))
+            {
+                Ok((session, paused, available)) => {
+                    let old = gate.remote_session.swap(session, Ordering::AcqRel);
+                    gate.remote_available.store(available, Ordering::Release);
+                    if session == 0 || (old != 0 && old != session) {
+                        gate.active.store(false, Ordering::Release);
+                    }
+                    if let Some(paused) = paused {
+                        gate.paused.store(paused, Ordering::Release);
+                    }
+                }
+                Err(_) => {
+                    gate.remote_available.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+    async fn remote(&self, request: &str) -> io::Result<String> {
+        tokio::time::timeout(Duration::from_millis(300), async {
+            let mut socket = UnixStream::connect(self.runtime.join("control")).await?;
+            socket.write_all(request.as_bytes()).await?;
+            let mut reply = String::new();
+            use tokio::io::AsyncReadExt;
+            tokio::io::BufReader::new(socket)
+                .take(128)
+                .read_line(&mut reply)
+                .await?;
+            if !reply.ends_with('\n') {
+                return Err(io::Error::other("Incomplete AirPlay control reply"));
+            }
+            Ok(reply)
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "AirPlay control timed out"))?
+    }
+    pub async fn command(
+        &self,
+        session: u32,
+        command: crate::transport::Command,
+        gate: &Gate,
+    ) -> io::Result<()> {
+        if session == 0
+            || !gate.active.load(Ordering::Acquire)
+            || gate.remote_session.load(Ordering::Acquire) != session
+            || !gate.remote_available.load(Ordering::Acquire)
+        {
+            return Err(io::Error::other(
+                "AirPlay sender control unavailable; update the AirPlay add-on or use the sender",
+            ));
+        }
+        let reply = self
+            .remote(&format!("COMMAND {session} {}\n", command.airplay_code()))
+            .await?;
+        if reply != "OK\n" {
+            return Err(io::Error::other("AirPlay sender rejected the command"));
+        }
+        use crate::transport::Command;
+        match command {
+            Command::Play => gate.paused.store(false, Ordering::Release),
+            Command::Pause => gate.paused.store(true, Ordering::Release),
+            Command::Toggle => {
+                gate.paused.fetch_xor(true, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+        Ok(())
     }
     pub fn status(&self, status: &mut control::Status, gate: &Gate) {
         status.airplay_available = self.available;
         status.airplay_enabled = self.enabled;
         status.airplay_running = self.running();
         status.airplay_active = gate.active.load(Ordering::Acquire);
+        status.airplay_remote = gate.remote_available.load(Ordering::Acquire);
         status.airplay_error.clone_from(&self.error);
     }
+}
+fn parse_remote_state(reply: &str) -> io::Result<(u32, Option<bool>, bool)> {
+    let parts: Vec<_> = reply.split_whitespace().collect();
+    if parts.len() != 4 || parts[0] != "STATE" {
+        return Err(io::Error::other("Invalid AirPlay state"));
+    }
+    let session = parts[1].parse::<u32>().map_err(io::Error::other)?;
+    let paused = match parts[2] {
+        "0" => Some(false),
+        "1" => Some(true),
+        "-1" => None,
+        _ => return Err(io::Error::other("Invalid AirPlay play state")),
+    };
+    let available = match parts[3] {
+        "0" => false,
+        "1" if session != 0 => true,
+        _ => return Err(io::Error::other("Invalid AirPlay availability")),
+    };
+    Ok((session, paused, available))
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
@@ -468,6 +586,86 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn remote_transport_keeps_session_and_rejects_stale_or_failed_commands() {
+        use crate::transport::Command as Transport;
+        let dir = std::env::temp_dir().join(format!("airplay-remote-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let profile = crate::profiles::load(Some("generic"), &dir).unwrap();
+        let mut runtime = Runtime::new(
+            &dir,
+            &dir,
+            "Test",
+            &profile.profile.audio,
+            Arc::new(crate::ducking::Ducking::new()),
+        );
+        runtime.runtime = dir.clone();
+        let listener = tokio::net::UnixListener::bind(dir.join("control")).unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, response) in [
+                ("COMMAND 7 1\n", "OK\n"),
+                ("COMMAND 7 0\n", "OK\n"),
+                ("COMMAND 7 4\n", "ERROR unavailable\n"),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(line, expected);
+                reader
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let gate = Gate::new();
+        gate.active.store(true, Ordering::Release);
+        gate.remote_session.store(7, Ordering::Release);
+        gate.remote_available.store(true, Ordering::Release);
+        assert!(runtime.command(6, Transport::Next, &gate).await.is_err());
+        runtime.command(7, Transport::Pause, &gate).await.unwrap();
+        assert!(gate.active.load(Ordering::Acquire) && gate.paused.load(Ordering::Acquire));
+        runtime.command(7, Transport::Play, &gate).await.unwrap();
+        assert!(gate.active.load(Ordering::Acquire) && !gate.paused.load(Ordering::Acquire));
+        assert!(runtime.command(7, Transport::Next, &gate).await.is_err());
+        gate.remote_available.store(false, Ordering::Release);
+        assert!(
+            runtime
+                .command(7, Transport::Previous, &gate)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn remote_state_preserves_unknown_play_state_and_validates_session() {
+        assert_eq!(
+            parse_remote_state("STATE 7 1 1\n").unwrap(),
+            (7, Some(true), true)
+        );
+        assert_eq!(
+            parse_remote_state("STATE 7 -1 1\n").unwrap(),
+            (7, None, true)
+        );
+        assert_eq!(
+            parse_remote_state("STATE 0 -1 0\n").unwrap(),
+            (0, None, false)
+        );
+        for reply in [
+            "STATE 0 1 1",
+            "STATE -1 0 0",
+            "STATE 7 2 1",
+            "STATE 7 0 2",
+            "STATE 7 0 1 extra",
+        ] {
+            assert!(parse_remote_state(reply).is_err(), "{reply}");
+        }
+    }
     #[tokio::test]
     async fn handover_waits_for_the_spotify_sink_to_close() {
         let gate = std::sync::Arc::new(Gate::new());
@@ -510,7 +708,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("airplay-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         let profile = crate::profiles::load(Some("generic"), &dir).unwrap();
-        let mut runtime = Runtime::new(&dir, &dir, "Test", &profile.profile.audio);
+        let mut runtime = Runtime::new(
+            &dir,
+            &dir,
+            "Test",
+            &profile.profile.audio,
+            Arc::new(crate::ducking::Ducking::new()),
+        );
         assert!(!runtime.available && !runtime.enabled && !runtime.valid(""));
         assert!(runtime.set_enabled(true).is_err());
         runtime.set_enabled(false).unwrap();
@@ -544,7 +748,13 @@ mod tests {
             fs::set_permissions(bins.join(name), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let profile = crate::profiles::load(Some("generic"), &dir).unwrap();
-        let mut runtime = Runtime::new(&dir, &dir, "Test", &profile.profile.audio);
+        let mut runtime = Runtime::new(
+            &dir,
+            &dir,
+            "Test",
+            &profile.profile.audio,
+            Arc::new(crate::ducking::Ducking::new()),
+        );
         runtime.runtime = dir.join("run");
         runtime.set_enabled(true).unwrap();
         let gate = Gate::new();
@@ -563,7 +773,16 @@ mod tests {
             assert!(!Path::new(&format!("/proc/{pid}")).exists());
         }
         runtime.set_enabled(false).unwrap();
-        assert!(!Runtime::new(&dir, &dir, "Test", &profile.profile.audio).enabled);
+        assert!(
+            !Runtime::new(
+                &dir,
+                &dir,
+                "Test",
+                &profile.profile.audio,
+                Arc::new(crate::ducking::Ducking::new())
+            )
+            .enabled
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

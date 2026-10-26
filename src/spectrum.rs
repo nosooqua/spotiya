@@ -364,7 +364,9 @@ pub fn airplay_worker(shared: Arc<crate::Shared>) -> std::thread::JoinHandle<()>
         let mut analyzer = Analyzer::new();
         let mut was_active = false;
         while shared.running.load(Ordering::Acquire) {
-            let active = shared.airplay.active.load(Ordering::Acquire) && shared.spectrum.enabled();
+            let active = shared.airplay.active.load(Ordering::Acquire)
+                && !shared.airplay.paused.load(Ordering::Acquire)
+                && shared.spectrum.enabled();
             if active && !was_active {
                 shared.spectrum.clear();
                 analyzer = Analyzer::new();

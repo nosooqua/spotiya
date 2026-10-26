@@ -29,6 +29,7 @@ fn main() {
     }
     native
         .file("controls/input.c")
+        .file("controls/ducking.c")
         .file("controls/stdio.c")
         .flag_if_supported("-std=c11")
         .flag_if_supported("-Os")
@@ -42,6 +43,8 @@ fn main() {
     println!("cargo:rerun-if-changed=controls/stdio.c");
     println!("cargo:rerun-if-changed=controls/mapped_input.h");
     println!("cargo:rerun-if-changed=controls/input.c");
+    println!("cargo:rerun-if-changed=controls/ducking.c");
+    println!("cargo:rerun-if-changed=controls/ducking.h");
     println!("cargo:rerun-if-changed=controls/input_config.h");
     println!("cargo:rerun-if-changed=controls/alsa_compat.c");
     if arm {

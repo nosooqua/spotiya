@@ -26,6 +26,7 @@ pub struct Status {
     pub airplay_enabled: bool,
     pub airplay_running: bool,
     pub airplay_active: bool,
+    pub airplay_remote: bool,
     pub airplay_error: String,
     pub paused: bool,
     pub loading: bool,
@@ -181,7 +182,13 @@ pub async fn serve(
                         "ERROR Retry is unavailable; wait {} seconds or check status\n",
                         status.retry_after_secs
                     )
+                } else if status.airplay_active
+                    && !status.airplay_remote
+                    && crate::transport::Command::from_intent(&intent).is_some()
+                {
+                    "ERROR AirPlay sender control unavailable; update the AirPlay add-on or use the sender\n".into()
                 } else if status.retry_required
+                    && !status.airplay_active
                     && matches!(
                         intent,
                         Intent::Play(_)

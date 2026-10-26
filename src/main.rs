@@ -54,6 +54,7 @@ mod recovery;
 mod screen;
 mod spectrum;
 mod supervisor;
+mod transport;
 mod tui;
 mod update;
 mod voice;
@@ -75,6 +76,7 @@ struct Prepare {
     request_id: Option<String>,
     received: Instant,
     epoch: u64,
+    source: transport::Source,
 }
 type SpircTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Connecting = Pin<Box<dyn Future<Output = Option<Result<(Spirc, SpircTask), Error>>>>>;
@@ -665,8 +667,14 @@ fn publish_status(
     text: &mut Vec<u8>,
 ) {
     let external = s.airplay.active.load(Ordering::Acquire);
-    s.paused
-        .store(!external && playback.paused(), Ordering::Relaxed);
+    s.paused.store(
+        if external {
+            s.airplay.paused.load(Ordering::Acquire)
+        } else {
+            playback.paused()
+        },
+        Ordering::Relaxed,
+    );
     s.active
         .store(external || playback.active(), Ordering::Release);
     info.airplay_active = external;
@@ -696,7 +704,11 @@ fn publish_status(
     info.paused = s.paused.load(Ordering::Relaxed);
     info.volume = percent(s.volume.load(Ordering::Relaxed));
     info.spectrum = s.spectrum.enabled();
-    info.ducking = playback.playing() && s.ducking.active();
+    info.ducking = (if external {
+        !info.paused
+    } else {
+        playback.playing()
+    }) && s.ducking.active();
     text.clear();
     serde_json::to_writer(&mut *text, info).unwrap();
     text.push(b'\n');
@@ -1022,8 +1034,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .ok_or_else(|| io::Error::other("No install directory"))?
         .to_path_buf();
-    let mut airplay =
-        airplay::Runtime::new(&base, &options.state_dir, &names.airplay, &profile.audio);
+    let mut airplay = airplay::Runtime::new(
+        &base,
+        &options.state_dir,
+        &names.airplay,
+        &profile.audio,
+        shared.ducking.clone(),
+    );
     airplay.poll(&shared.airplay).await;
     airplay.status(&mut info, &shared.airplay);
     let mut playback = playback::Playback::default();
@@ -1142,7 +1159,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             librespot::metadata::audio::UniqueFields::Local{artists,album,..}=>{info.artist=artists.unwrap_or_default();info.album=album.unwrap_or_default();},
                         }
                     },
-                    PlayerEvent::VolumeChanged{..}=>{shared.volume.store(mixer.volume(),Ordering::Release);},
+                    PlayerEvent::VolumeChanged{..} if !shared.airplay.active.load(Ordering::Acquire)=>{shared.volume.store(mixer.volume(),Ordering::Release);},
                     _=>{},
                 }
             },
@@ -1152,6 +1169,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         airplay::Action::Begin => {
                             voice_start.cancel();voice_epoch+=1;
                             shared.airplay.active.store(true,Ordering::Release);
+                            shared.airplay.paused.store(false,Ordering::Release);
+                            shared.airplay.remote_session.store(0,Ordering::Release);
                             if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
                             player.stop();playback.reset();
                             let released=shared.airplay.spotify_released(Instant::now()+Duration::from_millis(1500)).await;
@@ -1162,7 +1181,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             } else {airplay.stop(&shared.airplay).await;}
                             accepted
                         },
-                        airplay::Action::End=>{if shared.airplay.active.swap(false,Ordering::AcqRel) { shared.feedback.show(leds::Effect::Pause); } true},
+                        airplay::Action::End=>{
+                            // A paused sender may retain its session so Play can resume it.
+                            shared.airplay.paused.store(true,Ordering::Release);
+                            if shared.airplay.remote_session.load(Ordering::Acquire)==0 { shared.airplay.active.store(false,Ordering::Release); }
+                            true
+                        },
                         airplay::Action::Volume(value)=>{
                             if shared.airplay.active.load(Ordering::Acquire){mixer.set_master_volume(from_percent(value));}
                             true
@@ -1173,38 +1197,21 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             },
             Some(command)=command_rx.recv()=>{
                 if std::time::Instant::now()>=command.deadline || !shared.controls_enabled.load(Ordering::Acquire) {continue;}
-                let airplay_was_active = shared.airplay.active.load(Ordering::Acquire);
+                let source=transport::Source::current(&shared);
                 if matches!(command.action,0..=2) {voice_start.cancel();voice_epoch+=1;}
-                let step=command.volume_step as i32;
-                let ok=if shared.airplay.active.load(Ordering::Acquire) {
-                    if command.action==0 {airplay.stop(&shared.airplay).await;true}
-                    else if matches!(command.action,3|4){
-                        let target=(percent(mixer.volume()) as i32+if command.action==3{step}else{-step}).clamp(0,100) as u16;
-                        mixer.set_master_volume(from_percent(target));true
-                    } else {false}
-                } else if let Some(handle)=spirc.as_ref().filter(|_| shared.active.load(Ordering::Acquire)) {
-                    match command.action {
-                        0=>handle.play_pause().is_ok(),
-                        1=>handle.next().is_ok(),
-                        2=>handle.prev().is_ok(),
-                        3|4=>{
-                            let old=percent(mixer.volume()) as i32;
-                            let target=(old+if command.action==3 {step}else{-step}).clamp(0,100) as u16;
-                            mixer.set_master_volume(from_percent(target));
-                            handle.set_volume(mixer.volume()).is_ok()
-                        },
-                        _=>false,
-                    }
-                }else{false};
-                if ok {
-                    if matches!(command.action,3|4) { shared.volume_cue.notify(); }
-                    match command.action {
-                        1 => shared.feedback.show(leds::Effect::Next),
-                        2 => shared.feedback.show(leds::Effect::Previous),
-                        0 if airplay_was_active => shared.feedback.show(leds::Effect::Pause),
-                        _ => {},
-                    }
-                }
+                let intent=transport::button(command.action,percent(mixer.volume()),command.volume_step);
+                let ok=match intent {
+                    Some(voice::Intent::Volume(volume)) if shared.active.load(Ordering::Acquire)=>{
+                        let ok=transport::set_volume(volume,&mixer,&shared,spirc.as_ref());
+                        if ok {shared.volume_cue.notify();}
+                        ok
+                    },
+                    Some(intent)=>match transport::Command::from_intent(&intent) {
+                        Some(command)=>transport::execute(command,source,&shared,spirc.as_ref(),&airplay).await,
+                        None=>false,
+                    },
+                    None=>false,
+                };
                 let _=command.reply.send(ok);
             },
             Some(event)=voice_rx.recv()=>{
@@ -1212,9 +1219,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 if event.from_voice && !voice_enabled {continue;}
                 // Wake-word-free commands control only an owned playback session.
                 // The watcher excludes commands issued during an existing dialog.
-                if event.quick && (!shared.active.load(Ordering::Acquire)
-                    || (shared.airplay.active.load(Ordering::Acquire)
-                        && !matches!(event.intent, voice::Intent::Pause))) {continue;}
+                if event.quick && !shared.active.load(Ordering::Acquire) {continue;}
                 let intent=match event.intent {
                     voice::Intent::Airplay(enabled)=>{
                         if let Err(e)=airplay.set_enabled(enabled){eprintln!("airplay: {e}");}
@@ -1259,8 +1264,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     },
                     voice::Intent::Volume(volume)=>{
-                        mixer.set_master_volume(from_percent(volume));
-                        if let Some(handle)=spirc.as_ref(){let _=handle.set_volume(mixer.volume());}
+                        transport::set_volume(volume,&mixer,&shared,spirc.as_ref());
                         continue;
                     },
                     voice::Intent::Release=>{
@@ -1271,20 +1275,15 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         shared.active.store(false,Ordering::Release);audio_guard.set_playing(false);
                         continue;
                     },
-                    voice::Intent::Toggle=>if shared.active.load(Ordering::Acquire)&&!shared.paused.load(Ordering::Relaxed){voice::Intent::Pause}else{voice::Intent::Resume},
+                    voice::Intent::Toggle if !shared.active.load(Ordering::Acquire)=>voice::Intent::Resume,
                     intent=>intent,
                 };
-                if shared.airplay.active.load(Ordering::Acquire) {
-                    if matches!(intent,voice::Intent::Pause|voice::Intent::Toggle) {
-                        airplay.stop(&shared.airplay).await;
-                        shared.feedback.show(leds::Effect::Pause);
-                        continue;
-                    }
-                    if matches!(intent,voice::Intent::Play(_)|voice::Intent::Resume) {airplay.stop(&shared.airplay).await;}
-                    else {continue;}
+                if shared.airplay.active.load(Ordering::Acquire) && matches!(intent,voice::Intent::Play(_)) {airplay.stop(&shared.airplay).await;}
+                let source=transport::Source::current(&shared);
+                if source==transport::Source::Spotify {
+                    if failures.blocked() {continue;}
+                    if spirc.is_none() {eprintln!("voice: Spotify is not connected yet");continue;}
                 }
-                if failures.blocked() {continue;}
-                if spirc.is_none() {eprintln!("voice: Spotify is not connected yet");continue;}
                 let active=shared.active.load(Ordering::Acquire);
                 let wanted=match intent {
                     voice::Intent::Play(_)=>true,
@@ -1292,14 +1291,20 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     _=>active,
                 };
                 voice_start.cancel();voice_epoch+=1;
-                let request=Prepare{intent,from_voice:event.from_voice,request_id:event.request_id,received:event.received,epoch:voice_epoch};
+                let request=Prepare{intent,from_voice:event.from_voice,request_id:event.request_id,received:event.received,epoch:voice_epoch,source};
                 if wanted && native_tx.try_send(request).is_err() {eprintln!("voice: native command queue is full");}
             },
             Some((request,prepared))=prepared_rx.recv()=>{
                 if request.epoch!=voice_epoch || request.received.elapsed()>VOICE_EXPIRY {eprintln!("voice: stale command dropped");continue;}
-                if shared.airplay.active.load(Ordering::Acquire) || failures.blocked() {continue;}
+                if request.source!=transport::Source::current(&shared) {continue;}
                 let intent=request.intent;
-                let Some(handle)=spirc.as_ref() else {eprintln!("voice: Spotify is not connected yet");continue;};
+                if let Some(command)=transport::Command::from_intent(&intent)
+                    && shared.active.load(Ordering::Acquire) {
+                    transport::execute(command,request.source,&shared,spirc.as_ref(),&airplay).await;
+                    continue;
+                }
+                if request.source!=transport::Source::Spotify || failures.blocked() {continue;}
+                if spirc.is_none() {eprintln!("voice: Spotify is not connected yet");continue;}
                 match intent {
                     voice::Intent::Play(query)=>{
                         if !prepared {eprintln!("voice: could not cancel native conversation");continue;}
@@ -1312,16 +1317,6 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         let request=LoadRequest::from_tracks(vec![last_track.clone().unwrap()],LoadRequestOptions{start_playing:true,..Default::default()});
                         playback.clear_start_error();voice_start.begin(request);
                         eprintln!("voice: last Spotify track pending activation");
-                    },
-                    intent if shared.active.load(Ordering::Acquire)=>{
-                        match intent {
-                            voice::Intent::Pause=>{let _=handle.pause();},
-                            voice::Intent::Resume=>{let _=handle.play();},
-                            voice::Intent::Next if handle.next().is_ok()=>{ shared.feedback.show(leds::Effect::Next); },
-                            voice::Intent::Previous if handle.prev().is_ok()=>{ shared.feedback.show(leds::Effect::Previous); },
-                            _=>{},
-                        }
-                        eprintln!("voice: Spotify transport command queued");
                     },
                     _=>{},
                 }
@@ -1341,12 +1336,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(target)=guard.restore_target(value,desired)
                             && let Ok(actual)=if target==value {Ok(value)} else {mixer.write(target)} {
                                 shared.volume.store(actual,Ordering::Release);guard.restored();
-                                if let Some(handle)=spirc.as_ref(){let _=handle.set_volume(actual);}
+                                if !shared.airplay.active.load(Ordering::Acquire) && let Some(handle)=spirc.as_ref(){let _=handle.set_volume(actual);}
                                 eprintln!("volume: restored after Alice conversation");
                         }
                     } else {
                         let previous=shared.volume.swap(value,Ordering::AcqRel);
-                        if value!=previous && shared.active.load(Ordering::Acquire)
+                        if value!=previous && shared.active.load(Ordering::Acquire) && !shared.airplay.active.load(Ordering::Acquire)
                             && let Some(handle)=spirc.as_ref() {let _=handle.set_volume(value);}
                     }
                 }
@@ -1370,7 +1365,11 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        let playing = playback.playing() || shared.airplay.active.load(Ordering::Acquire);
+        let playing = if shared.airplay.active.load(Ordering::Acquire) {
+            !shared.airplay.paused.load(Ordering::Acquire)
+        } else {
+            playback.playing()
+        };
         audio_guard.set_playing(playing);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();

@@ -110,6 +110,9 @@ fn allowed(addon: &Addon, path: &Path) -> bool {
             | "revisions.json"
             | "avahi-no-reverse.patch"
             | "avahi-runtime-user.patch"
+            | "shairport-control.patch"
+            | "spotiya-control.c"
+            | "spotiya-control.h"
     ) || addon.bins.iter().any(|b| p == format!("bin/{b}"))
         || (p.starts_with("licenses/") && path.components().count() == 4)
 }
